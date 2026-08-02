@@ -101,6 +101,7 @@ final class NTFSVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWriteOperati
     /// buffer-cache I/O as soon as the kernel accepts it.
     private func readAligned(into scratch: UnsafeMutableRawBufferPointer,
                              at start: Int64, length: Int) throws {
+        dispatchPrecondition(condition: .onQueue(engineQueue))
         if ioMode == .metadata {
             try resource.metadataRead(into: scratch, startingAt: off_t(start),
                                       length: length)
@@ -118,19 +119,30 @@ final class NTFSVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWriteOperati
         }
     }
 
-    /// Aligned whole-block write through the current mode.
+    /// Aligned whole-block write. Upgrades to buffer-cache I/O the same way
+    /// reads do — critical: once the kernel mount exists, plain resource.write
+    /// races the kernel's direct KOIO writes (torn MFT/$Bitmap sectors), so we
+    /// must move onto metadataWrite as soon as the cache accepts it.
     private func writeAligned(_ scratch: UnsafeMutableRawBufferPointer,
                               at start: Int64, length: Int) throws {
+        dispatchPrecondition(condition: .onQueue(engineQueue))
         if ioMode == .metadata {
             try resource.metadataWrite(from: UnsafeRawBufferPointer(scratch),
                                        startingAt: off_t(start), length: length)
             return
         }
-        // Pre-mount: plain writes are safe (no concurrent kernel I/O exists
-        // yet) and required (buffer cache not attached until the mount).
-        let n = try resource.write(from: UnsafeRawBufferPointer(scratch),
-                                   startingAt: off_t(start), length: length)
-        guard n == length else { throw posix(EIO) }
+        do {
+            try resource.metadataWrite(from: UnsafeRawBufferPointer(scratch),
+                                       startingAt: off_t(start), length: length)
+            ioMode = .metadata
+            log.info("device I/O upgraded to kernel buffer cache (write)")
+        } catch {
+            // Pre-mount only: buffer cache not attached yet, no kernel I/O in
+            // flight, plain write is safe.
+            let n = try resource.write(from: UnsafeRawBufferPointer(scratch),
+                                       startingAt: off_t(start), length: length)
+            guard n == length else { throw posix(EIO) }
+        }
     }
 
     /// Aligned pwrite through the kernel buffer cache, with read-modify-write
@@ -214,6 +226,10 @@ final class NTFSVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWriteOperati
         engineQueue.sync {
             let rc: Int32 = vol.map { nk_umount($0) } ?? 0
             vol = nil
+            // If FSKit reactivates this instance, the next engine open happens
+            // pre-mount again — the buffer cache won't be attached, so start
+            // back in probing mode.
+            ioMode = .probing
             return rc
         }
     }
@@ -687,6 +703,9 @@ extension NTFSVolume: FSVolume.XattrOperations {
                 xname.withCString { n -> Data? in
                     let size = nk_xattr_get(vol, p, n, nil, 0)
                     guard size >= 0 else { return nil }
+                    // macOS caps xattrs at ~64 KB; a corrupt/huge ADS size must
+                    // not drive a giant Data(count:) that kills the extension.
+                    guard size <= 4 << 20 else { return nil }
                     if size == 0 { return Data() }
                     var data = Data(count: Int(size))
                     let got = data.withUnsafeMutableBytes {
@@ -709,47 +728,31 @@ extension NTFSVolume: FSVolume.XattrOperations {
         }
         if readOnly { throw posix(EROFS) }
 
-        func exists() -> Bool {
+        // Existence check + mutation in ONE engine hold — otherwise a
+        // concurrent upcall between the two could violate .mustCreate /
+        // .mustReplace. `errno`-style POSIX result mapped after the hold.
+        let rc: Int32 = value.withUnsafeBytesOrNil { raw in
             engineQueue.sync {
                 item.path.withCString { p in
-                    xname.withCString { n in nk_xattr_get(vol, p, n, nil, 0) }
-                }
-            } >= 0
-        }
-
-        // Honor the kernel's create/replace semantics (XATTR_CREATE etc.).
-        switch policy {
-        case .mustCreate: if exists() { throw posix(EEXIST) }
-        case .mustReplace: if !exists() { throw posix(ENOATTR) }
-        case .delete:
-            let rc = engineQueue.sync {
-                item.path.withCString { p in
-                    xname.withCString { n in nk_xattr_remove(vol, p, n) }
-                }
-            }
-            guard rc == 0 else { throw posix(ENOATTR) }
-            return
-        default: break
-        }
-        guard let value else {   // nil value = delete
-            let rc = engineQueue.sync {
-                item.path.withCString { p in
-                    xname.withCString { n in nk_xattr_remove(vol, p, n) }
-                }
-            }
-            guard rc == 0 else { throw posix(ENOATTR) }
-            return
-        }
-        let rc = value.withUnsafeBytes { raw in
-            engineQueue.sync {
-                item.path.withCString { p in
-                    xname.withCString { n in
-                        nk_xattr_set(vol, p, n, raw.baseAddress, Int64(raw.count))
+                    xname.withCString { n -> Int32 in
+                        let present = nk_xattr_get(vol, p, n, nil, 0) >= 0
+                        switch policy {
+                        case .mustCreate where present: return EEXIST
+                        case .mustReplace where !present: return ENOATTR
+                        case .delete:
+                            return nk_xattr_remove(vol, p, n) == 0 ? 0 : ENOATTR
+                        default: break
+                        }
+                        guard let raw else {   // nil value = delete
+                            return nk_xattr_remove(vol, p, n) == 0 ? 0 : ENOATTR
+                        }
+                        return nk_xattr_set(vol, p, n, raw.baseAddress,
+                                            Int64(raw.count)) == 0 ? 0 : EIO
                     }
                 }
             }
         }
-        guard rc == 0 else { throw posix(EIO) }
+        guard rc == 0 else { throw posix(rc) }
     }
 }
 
@@ -885,6 +888,17 @@ extension NTFSVolume: FSVolumeKernelOffloadedIOOperations {
     func lookupItem(name: FSFileName, in directory: FSItem,
                     packer: FSExtentPacker) async throws -> (FSItem, FSFileName) {
         try await lookupItem(named: name, inDirectory: directory)
+    }
+}
+
+private extension Optional where Wrapped == Data {
+    /// Run `body` with the bytes (or nil when self is nil) — lets the xattr
+    /// set/delete path do everything inside one closure.
+    func withUnsafeBytesOrNil<R>(_ body: (UnsafeRawBufferPointer?) -> R) -> R {
+        switch self {
+        case .some(let d): return d.withUnsafeBytes { body($0) }
+        case .none: return body(nil)
+        }
     }
 }
 

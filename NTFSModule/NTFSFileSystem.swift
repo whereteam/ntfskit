@@ -58,9 +58,14 @@ final class NTFSFileSystem: FSUnaryFileSystem, FSUnaryFileSystemOperations {
             for i in (0..<8).reversed() { v = v << 8 | Int64(b[o + i]) }
             return v
         }
+        func isPow2(_ n: Int) -> Bool { n > 0 && (n & (n - 1)) == 0 }
         let bytesPerSector = le16(boot, 0x0B)
-        guard bytesPerSector >= 256, bytesPerSector <= 4096 else { return nil }
+        guard bytesPerSector >= 256, bytesPerSector <= 4096,
+              isPow2(bytesPerSector) else { return nil }
         let spc = Int(boot[0x0D])
+        // Sectors-per-cluster must be a power of two (1…128) or the extended
+        // 2^(256-spc) encoding — reject invented values like 3.
+        guard spc > 0x80 || isPow2(spc) else { return nil }
         // Sectors-per-cluster > 0x80 encodes 2^(256-spc). Bound the exponent
         // BEFORE shifting — an unbounded `1 << n` traps for n >= 64, and this
         // runs on untrusted boot sectors at probe time.
@@ -88,7 +93,10 @@ final class NTFSFileSystem: FSUnaryFileSystem, FSUnaryFileSystemOperations {
         guard recordSize >= 512, recordSize <= 65536 else { return nil }
 
         // $Volume = MFT record 3 (within the MFT's first, always-contiguous run)
-        let offset = mftLCN * Int64(clusterSize) + Int64(3 * recordSize)
+        let base = mftLCN * Int64(clusterSize)
+        let add = Int64(3 * recordSize)
+        guard base <= Int64.max - add else { return nil }   // sum can trap too
+        let offset = base + add
         var rec = [UInt8](repeating: 0, count: recordSize)
         let got = (try? rec.withUnsafeMutableBytes { raw in
             try block.read(into: raw, startingAt: off_t(offset), length: recordSize)
@@ -98,12 +106,18 @@ final class NTFSFileSystem: FSUnaryFileSystem, FSUnaryFileSystemOperations {
             return nil   // "FILE"
         }
         // Apply update-sequence fixups (last 2 bytes of each sector).
+        // Record must be a whole number of sectors, and the USA must describe
+        // exactly that many (+1 for the USN itself); each sector trailer must
+        // currently hold the USN or the record is torn/forged.
         let usaOfs = le16(rec, 4), usaCount = le16(rec, 6)
-        guard usaCount > 1, usaOfs + usaCount * 2 <= recordSize,
-              recordSize >= usaCount &* bytesPerSector - bytesPerSector else { return nil }
+        guard recordSize % bytesPerSector == 0,
+              usaCount == recordSize / bytesPerSector + 1,
+              usaOfs >= 0x2A, usaOfs + usaCount * 2 <= recordSize else { return nil }
+        let usn0 = rec[usaOfs], usn1 = rec[usaOfs + 1]
         for i in 1..<usaCount {
             let pos = i * bytesPerSector - 2
-            guard pos + 1 < recordSize else { return nil }
+            guard pos + 1 < recordSize,
+                  rec[pos] == usn0, rec[pos + 1] == usn1 else { return nil }
             rec[pos] = rec[usaOfs + i * 2]
             rec[pos + 1] = rec[usaOfs + i * 2 + 1]
         }
@@ -111,13 +125,15 @@ final class NTFSFileSystem: FSUnaryFileSystem, FSUnaryFileSystemOperations {
         var a = le16(rec, 0x14)
         while a + 8 <= recordSize {
             let type = le16(rec, a) | le16(rec, a + 2) << 16
-            if type == 0xFFFF_FFFF || type == 0xFFFF { break }
+            if type == 0xFFFF_FFFF { break }   // 0xFFFFFFFF = end of attributes
             let alen = le16(rec, a + 4) | le16(rec, a + 6) << 16
             guard alen >= 24, a + alen <= recordSize else { return nil }
             if type == 0x60, rec[a + 8] == 0 {   // resident
                 let vlen = le16(rec, a + 0x10) | le16(rec, a + 0x12) << 16
                 let vofs = le16(rec, a + 0x14)
+                // Confine the value to this attribute, not just the record.
                 guard vlen > 0, vlen <= 256, vlen % 2 == 0,
+                      vofs >= 24, vofs + vlen <= alen,
                       a + vofs + vlen <= recordSize else { return nil }
                 let data = Data(rec[(a + vofs)..<(a + vofs + vlen)])
                 let s = String(data: data, encoding: .utf16LittleEndian)?

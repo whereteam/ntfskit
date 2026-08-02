@@ -4,10 +4,20 @@
 DIR="$(dirname "$0")"
 LABEL="NTFS"
 while getopts "v:" opt; do
-  case $opt in v) LABEL="$OPTARG" ;; esac
+  case $opt in
+    v) LABEL="$OPTARG" ;;
+    *) echo "newfs_ntfskit: bad option" >&2; exit 1 ;;   # reject ? and missing-arg
+  esac
 done
 shift $((OPTIND-1))
+# Exactly one device operand.
+[ $# -eq 1 ] || { echo "newfs_ntfskit: expected one device" >&2; exit 1; }
 DEV="$1"
 # mkntfs does unaligned writes; the raw node returns EINVAL — use buffered.
 DEV=$(printf "%s" "$DEV" | sed "s|/dev/rdisk|/dev/disk|")
-exec "$DIR/mkntfs" --force --fast -L "$LABEL" "$DEV"
+# Only ever touch a real disk node — refuse empty/odd targets.
+case "$DEV" in
+  /dev/disk*) ;;
+  *) echo "newfs_ntfskit: refusing non-disk target: $DEV" >&2; exit 1 ;;
+esac
+exec "$DIR/mkntfs" --force --fast -L "$LABEL" -- "$DEV"
