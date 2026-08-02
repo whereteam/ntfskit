@@ -61,12 +61,30 @@ final class NTFSFileSystem: FSUnaryFileSystem, FSUnaryFileSystemOperations {
         let bytesPerSector = le16(boot, 0x0B)
         guard bytesPerSector >= 256, bytesPerSector <= 4096 else { return nil }
         let spc = Int(boot[0x0D])
-        let clusterSize = spc > 0x80 ? (1 << (256 - spc)) : spc * bytesPerSector
+        // Sectors-per-cluster > 0x80 encodes 2^(256-spc). Bound the exponent
+        // BEFORE shifting — an unbounded `1 << n` traps for n >= 64, and this
+        // runs on untrusted boot sectors at probe time.
+        let clusterSize: Int
+        if spc > 0x80 {
+            let exp = 256 - spc
+            guard exp < 22 else { return nil }        // 2^21 = 2 MB cap
+            clusterSize = 1 << exp
+        } else {
+            clusterSize = spc * bytesPerSector
+        }
         guard clusterSize > 0, clusterSize <= 2 << 20 else { return nil }
         let mftLCN = le64(boot, 0x30)
-        guard mftLCN > 0 else { return nil }
+        guard mftLCN > 0, mftLCN <= Int64.max / Int64(clusterSize) else { return nil }
+        // Bytes-per-file-record: negative → 2^(-cpr), else cpr clusters.
         let cpr = Int(Int8(bitPattern: boot[0x40]))
-        let recordSize = cpr < 0 ? (1 << -cpr) : cpr * clusterSize
+        let recordSize: Int
+        if cpr < 0 {
+            guard -cpr < 22 else { return nil }
+            recordSize = 1 << (-cpr)
+        } else {
+            guard cpr > 0, cpr <= 65536 / max(clusterSize, 1) else { return nil }
+            recordSize = cpr * clusterSize
+        }
         guard recordSize >= 512, recordSize <= 65536 else { return nil }
 
         // $Volume = MFT record 3 (within the MFT's first, always-contiguous run)
