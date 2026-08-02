@@ -47,9 +47,9 @@ targets:
   NTFSModule:
     type: extensionkit-extension
     platform: macOS
-    # 26.4+: requestedMountOptions (kernel-visible RO fallback) needs it, and
-    # KOIO is a macOS 26 feature anyway — we only test on 26.5.
-    deploymentTarget: "26.4"
+    # Floor is macOS 15.4 (Sequoia) — where FSKit first shipped. KOIO + buffer-
+    # cache I/O are V1 (15.4). Only requestedMountOptions (26.4) and openUnlink
+    deploymentTarget: "15.4"
     sources:
       - path: NTFSModule
         excludes:

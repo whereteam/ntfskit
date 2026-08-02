@@ -184,7 +184,7 @@ final class NTFSVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWriteOperati
         self.resource = resource
         self._readOnly = readOnly
         super.init(volumeID: volumeID, volumeName: volumeName)
-        if readOnly { requestedMountOptions = [.readOnly] }
+        wantReadOnlyMount = readOnly
     }
 
     // MARK: engine
@@ -212,7 +212,7 @@ final class NTFSVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWriteOperati
                 if let handle = nk_mount_io(&io, &errbuf, 256) {
                     log.info("falling back to READ-ONLY mount: \(reason, privacy: .public)")
                     readOnly = true
-                    requestedMountOptions = [.readOnly]
+                    wantReadOnlyMount = true
                     vol = handle
                     return
                 }
@@ -256,15 +256,26 @@ final class NTFSVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWriteOperati
 
     // MARK: FSVolume.Operations
 
+    /// Version-independent intent (Bool, no 26-only type) — the actual
+    /// `requestedMountOptions` witness below is gated to macOS 26.4 where
+    /// FSMountOptions exists. On 15.4–26.3 the kernel mount mode just follows
+    /// the block device's own writability; the volume still works read-only.
+    fileprivate var wantReadOnlyMount = false
+
     /// FSKit reads this after mount() replies — if the engine fell back to
     /// read-only (hibernated Windows, bad journal), the KERNEL mount goes
-    /// read-only too, so Finder/statfs agree with reality. (Stored + settable
-    /// because the ObjC optional protocol property demands get/set.)
-    var requestedMountOptions: FSVolume.MountOptions = []
+    /// read-only too, so Finder/statfs agree with reality. Only on 26.4+
+    /// (FSMountOptions is a V2.4 API).
+    @available(macOS 26.4, *)
+    var requestedMountOptions: FSVolume.MountOptions {
+        wantReadOnlyMount ? [.readOnly] : []
+    }
 
     /// POSIX open-unlink semantics (delete an open file, keep using it) —
-    /// FSKit emulates it for us via rename + deferred delete.
-    var enableOpenUnlinkEmulation: Bool = true
+    /// FSKit emulates it via rename + deferred delete. V2 API (macOS 26+);
+    /// on 15.4 the kernel simply doesn't offer the emulation.
+    @available(macOS 26.0, *)
+    var enableOpenUnlinkEmulation: Bool { true }
 
     var supportedVolumeCapabilities: FSVolume.SupportedCapabilities {
         let caps = FSVolume.SupportedCapabilities()
