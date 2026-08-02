@@ -53,7 +53,7 @@
 		<key>FSCheckOptionSyntax</key>
 		<dict>
 			<key>shortOptions</key>
-			<string>nqy</string>
+			<string>pynqM:</string>
 		</dict>
 		<key>FSPersonalities</key>
 		<dict>
