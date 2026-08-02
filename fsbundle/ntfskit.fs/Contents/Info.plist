@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+	<key>CFBundleIdentifier</key>
+	<string>com.whereteam.ntfskit.fs</string>
+	<key>CFBundleInfoDictionaryVersion</key>
+	<string>6.0</string>
+	<key>CFBundleName</key>
+	<string>ntfskit</string>
+	<key>CFBundlePackageType</key>
+	<string>fs  </string>
+	<key>CFBundleShortVersionString</key>
+	<string>1.0</string>
+	<key>CFBundleVersion</key>
+	<string>1.0</string>
+	<key>FSImplementation</key>
+	<array>
+		<string>FSKit</string>
+	</array>
+	<key>FSPersonalities</key>
+	<dict>
+		<key>NTFSKit</key>
+		<dict>
+			<key>FSName</key>
+			<string>Windows NT Filesystem (NTFSKit)</string>
+			<key>FSFormatExecutable</key>
+			<string>newfs_ntfskit</string>
+			<key>FSFormatArguments</key>
+			<string></string>
+			<key>FSFormatContentMask</key>
+			<string>Windows_NTFS</string>
+			<key>FSFormatMinimumSize</key>
+			<integer>1048576</integer>
+			<key>FSFormatMaximumSize</key>
+			<integer>281474976710656</integer>
+		</dict>
+	</dict>
+</dict>
+</plist>

@@ -1,0 +1,81 @@
+name: NTFSKit
+
+options:
+  bundleIdPrefix: com.whereteam
+  deploymentTarget:
+    macOS: "15.4"
+  createIntermediateGroups: true
+
+settings:
+  base:
+    MARKETING_VERSION: "0.1.0"
+    CURRENT_PROJECT_VERSION: "1"
+    SWIFT_VERSION: "5.0"
+    MACOSX_DEPLOYMENT_TARGET: "15.4"
+    ARCHS: arm64                  # libntfs-3g.a is arm64-only for now
+    ONLY_ACTIVE_ARCH: "YES"
+    CODE_SIGN_STYLE: Automatic
+    DEVELOPMENT_TEAM: "U99A3XY2Q2"   # DNA MAKER COMPANY LIMITED
+    ENABLE_HARDENED_RUNTIME: "NO"
+    DEAD_CODE_STRIPPING: "YES"
+
+targets:
+  NTFSKit:
+    type: application
+    platform: macOS
+    sources:
+      - path: App
+      - path: fsbundle/ntfskit.fs
+        type: folder
+        buildPhase: resources
+    info:
+      path: App/Info.plist
+      properties:
+        CFBundleDisplayName: NTFSKit
+        LSApplicationCategoryType: public.app-category.utilities
+        LSMinimumSystemVersion: "15.4"
+        NSPrincipalClass: NSApplication
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.whereteam.ntfskit
+        PRODUCT_NAME: NTFSKit
+        CODE_SIGN_ENTITLEMENTS: App/App.entitlements
+    dependencies:
+      - target: NTFSModule
+        embed: true
+
+  NTFSModule:
+    type: extensionkit-extension
+    platform: macOS
+    # 26.4+: requestedMountOptions (kernel-visible RO fallback) needs it, and
+    # KOIO is a macOS 26 feature anyway — we only test on 26.5.
+    deploymentTarget: "26.4"
+    sources:
+      - path: NTFSModule
+        excludes:
+          - "bridge/test_bridge.c"
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: com.whereteam.ntfskit.NTFSModule
+        INFOPLIST_FILE: NTFSModule/Info.plist
+        GENERATE_INFOPLIST_FILE: "NO"
+        SWIFT_OBJC_BRIDGING_HEADER: NTFSModule/Bridging-Header.h
+        CODE_SIGN_ENTITLEMENTS: NTFSModule/NTFSModule.entitlements
+        HEADER_SEARCH_PATHS:
+          - $(SRCROOT)/refs/ntfs-3g/include
+          - $(SRCROOT)/refs/ntfs-3g/include/ntfs-3g
+          - $(SRCROOT)/refs/ntfs-3g
+          - $(SRCROOT)/NTFSModule/bridge
+          - $(SRCROOT)/NTFSModule/bridge/mkntfs
+        GCC_PREPROCESSOR_DEFINITIONS:
+          - HAVE_CONFIG_H=1
+        OTHER_LDFLAGS:
+          - $(SRCROOT)/refs/ntfs-3g/libntfs-3g/.libs/libntfs-3g.a
+
+schemes:
+  NTFSKit:
+    build:
+      targets:
+        NTFSKit: all
+    run:
+      config: Debug

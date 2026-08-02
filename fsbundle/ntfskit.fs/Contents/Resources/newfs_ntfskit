@@ -1,0 +1,13 @@
+#!/bin/sh
+# newfs-style shim over mkntfs for NTFSKit.
+# diskutil calls: newfs_ntfskit [-v VolumeName] /dev/rdiskXsY
+DIR="$(dirname "$0")"
+LABEL="NTFS"
+while getopts "v:" opt; do
+  case $opt in v) LABEL="$OPTARG" ;; esac
+done
+shift $((OPTIND-1))
+DEV="$1"
+# mkntfs does unaligned writes; the raw node returns EINVAL — use buffered.
+DEV=$(printf "%s" "$DEV" | sed "s|/dev/rdisk|/dev/disk|")
+exec "$DIR/mkntfs" --force --fast -L "$LABEL" "$DEV"

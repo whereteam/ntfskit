@@ -1,0 +1,11 @@
+NTFSKit — licensing overview
+
+- NTFSModule/ (the FSKit driver, incl. bridge/ and bridge/mkntfs/) and
+  fsbundle/ are licensed under the GNU General Public License v2.0
+  (see NTFSModule/LICENSE.GPL2), as derivative works of libntfs-3g and
+  ntfsprogs (Copyright their respective authors, dual-licensed
+  commercially by Tuxera Inc.).
+- App/ (the NTFSKit host application UI) is proprietary,
+  Copyright (c) 2026 DNA MAKER COMPANY LIMITED. All rights reserved.
+  It communicates with the driver only through public macOS interfaces
+  (mere aggregation under GPLv2).

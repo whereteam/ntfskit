@@ -1,0 +1,7 @@
+.DS_Store
+*.xcodeproj/
+DerivedData/
+.pm/
+refs/
+*.img
+*.dmg
