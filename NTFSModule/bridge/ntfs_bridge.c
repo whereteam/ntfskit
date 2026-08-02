@@ -22,9 +22,15 @@
 #include <ntfs-3g/reparse.h>
 #include <ntfs-3g/runlist.h>
 
+struct nk_bde;   /* BitLocker decryption chain, defined in nk_bde.c */
+struct ntfs_device *nk_bde_open(const nk_io *io, const char *cred, int cred_kind,
+                                struct nk_bde **out, char *errbuf, size_t errlen);
+void nk_bde_free(struct nk_bde *b);
+
 struct nk_volume {
     ntfs_volume *vol;
-    void *devctx;   /* nk_devctx when mounted via nk_mount_io */
+    void *devctx;        /* nk_devctx when mounted via nk_mount_io */
+    struct nk_bde *bde;  /* BitLocker chain when mounted encrypted */
 };
 
 /* ---- callback-backed ntfs_device ---- */
@@ -161,8 +167,32 @@ int nk_umount(nk_volume *v) {
     if (!v) return -1;
     int r = v->vol ? ntfs_umount(v->vol, FALSE) : 0;  /* frees the device too */
     free(v->devctx);
+    if (v->bde) nk_bde_free(v->bde);   /* tears down libbde + libbfio */
     free(v);
     return r;
+}
+
+nk_volume *nk_mount_bitlocker(const nk_io *io, const char *cred, int cred_kind,
+                              char *errbuf, size_t errlen) {
+    if (!io || !cred) return NULL;
+    struct nk_bde *bde = NULL;
+    struct ntfs_device *dev = nk_bde_open(io, cred, cred_kind, &bde, errbuf, errlen);
+    if (!dev) return NULL;   /* errbuf set by nk_bde_open */
+
+    /* Decrypted stream is read-only; recover the journal in memory only. */
+    ntfs_volume *vol = ntfs_device_mount(dev, NTFS_MNT_RDONLY);
+    if (!vol) {
+        if (errbuf && errlen)
+            snprintf(errbuf, errlen, "decrypted, but not NTFS: %s", strerror(errno));
+        ntfs_device_free(dev);
+        nk_bde_free(bde);
+        return NULL;
+    }
+    nk_volume *v = calloc(1, sizeof(*v));
+    if (!v) { ntfs_umount(vol, TRUE); nk_bde_free(bde); return NULL; }
+    v->vol = vol;
+    v->bde = bde;
+    return v;
 }
 
 int nk_statvfs(nk_volume *v, long long *total_bytes, long long *free_bytes,

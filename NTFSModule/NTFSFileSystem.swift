@@ -35,6 +35,14 @@ final class NTFSFileSystem: FSUnaryFileSystem, FSUnaryFileSystemOperations {
         let read = try boot.withUnsafeMutableBytes { raw in
             try block.read(into: raw, startingAt: 0, length: 512)
         }
+        // BitLocker-encrypted volume: OEM id at 0x03 is "-FVE-FS-". We can't
+        // auto-mount it (needs the user's recovery key) — decline here; the
+        // app detects it separately and offers unlock. Logging it beats a
+        // silent "unreadable disk".
+        if read >= 11, boot.withUnsafeBufferPointer({ nk_is_bitlocker($0.baseAddress!) }) != 0 {
+            log.info("probe: BitLocker-encrypted volume — needs unlock, not auto-mounted")
+            return .notRecognized
+        }
         // Boot sector bytes 3..6 spell "NTFS".
         guard read >= 8,
               boot[3] == 0x4E, boot[4] == 0x54, boot[5] == 0x46, boot[6] == 0x53 else {

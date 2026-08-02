@@ -67,10 +67,31 @@ targets:
           - $(SRCROOT)/refs/ntfs-3g
           - $(SRCROOT)/NTFSModule/bridge
           - $(SRCROOT)/NTFSModule/bridge/mkntfs
+          - $(SRCROOT)/refs/libbde/include
+          - $(SRCROOT)/NTFSModule/bridge/bde-shim
         GCC_PREPROCESSOR_DEFINITIONS:
           - HAVE_CONFIG_H=1
         OTHER_LDFLAGS:
           - $(SRCROOT)/refs/ntfs-3g/libntfs-3g/.libs/libntfs-3g.a
+          # BitLocker: libbde + its bundled libyal deps (static). All 17 in
+          # one -force_load-free list; order doesn't matter for archives.
+          - $(SRCROOT)/refs/libbde/libbde/.libs/libbde.a
+          - $(SRCROOT)/refs/libbde/libbfio/.libs/libbfio.a
+          - $(SRCROOT)/refs/libbde/libcaes/.libs/libcaes.a
+          - $(SRCROOT)/refs/libbde/libhmac/.libs/libhmac.a
+          - $(SRCROOT)/refs/libbde/libcdata/.libs/libcdata.a
+          - $(SRCROOT)/refs/libbde/libcerror/.libs/libcerror.a
+          - $(SRCROOT)/refs/libbde/libcfile/.libs/libcfile.a
+          - $(SRCROOT)/refs/libbde/libclocale/.libs/libclocale.a
+          - $(SRCROOT)/refs/libbde/libcnotify/.libs/libcnotify.a
+          - $(SRCROOT)/refs/libbde/libcpath/.libs/libcpath.a
+          - $(SRCROOT)/refs/libbde/libcsplit/.libs/libcsplit.a
+          - $(SRCROOT)/refs/libbde/libcthreads/.libs/libcthreads.a
+          - $(SRCROOT)/refs/libbde/libfcache/.libs/libfcache.a
+          - $(SRCROOT)/refs/libbde/libfdatetime/.libs/libfdatetime.a
+          - $(SRCROOT)/refs/libbde/libfguid/.libs/libfguid.a
+          - $(SRCROOT)/refs/libbde/libfvalue/.libs/libfvalue.a
+          - $(SRCROOT)/refs/libbde/libuna/.libs/libuna.a
 
 schemes:
   NTFSKit:

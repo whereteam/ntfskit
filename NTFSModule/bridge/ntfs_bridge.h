@@ -127,6 +127,22 @@ int nk_fsck(const nk_io *io, int repair, char *errbuf, size_t errlen);
 /* Quick-format the device as NTFS via mkntfs. Not thread-safe. 0 / -1. */
 int nk_format(const nk_io *io, const char *label, char *errbuf, size_t errlen);
 
+/* ---- BitLocker (encrypted NTFS) ---- */
+
+/* 1 if the 512-byte boot sector is a BitLocker volume ("-FVE-FS-"). */
+int nk_is_bitlocker(const unsigned char boot[512]);
+
+/* Credential kinds for nk_mount_bitlocker / nk_bde_open. */
+#define NK_BDE_RECOVERY 0   /* 48-digit recovery password */
+#define NK_BDE_PASSWORD 1   /* user password */
+
+/* Mount a BitLocker-encrypted NTFS volume READ-ONLY: unlock with `cred`
+ * (recovery password or user password per cred_kind), then mount the
+ * decrypted stream. Returns nk_volume* / NULL. Free with nk_umount as usual —
+ * it tears down the decryption chain too. */
+nk_volume *nk_mount_bitlocker(const nk_io *io, const char *cred, int cred_kind,
+                              char *errbuf, size_t errlen);
+
 /* Set the NTFS volume label. Returns 0 / -1. */
 int nk_set_label(nk_volume *v, const char *label);
 

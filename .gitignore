@@ -5,3 +5,6 @@ DerivedData/
 refs/
 *.img
 *.dmg
+
+# BitLocker (libbde)
+refs/libbde/
