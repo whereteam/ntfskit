@@ -1,0 +1,150 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>NTFSKit — NTFS read &amp; write for macOS. No kext. No compromise.</title>
+<meta name="description" content="The world's first pure-FSKit NTFS driver with Kernel-Offloaded I/O. Plug in an NTFS disk — it mounts read/write at device speed.">
+<style>
+  :root {
+    --bg: #f5f7fb; --fg: #0d1220; --muted: #5a6376; --card: #ffffff;
+    --line: #e3e7f0; --accent: #1a5cf2; --accent2: #18b7b0; --warn: #e58900;
+  }
+  @media (prefers-color-scheme: dark) {
+    :root { --bg: #0b0f17; --fg: #eef1f8; --muted: #9aa3b5; --card: #131926;
+            --line: #232b3d; --accent: #4d84ff; --accent2: #2bd4cc; }
+  }
+  * { box-sizing: border-box; margin: 0; }
+  body { font: 16px/1.6 -apple-system, "SF Pro Text", Inter, sans-serif;
+         background: var(--bg); color: var(--fg); }
+  .wrap { max-width: 880px; margin: 0 auto; padding: 0 24px; }
+  header { padding: 72px 0 40px; text-align: center;
+           background: linear-gradient(160deg, color-mix(in srgb, var(--accent2) 12%, var(--bg)), var(--bg) 70%); }
+  .logo { width: 96px; height: 96px; border-radius: 22px; margin: 0 auto 18px;
+          background: linear-gradient(135deg, var(--accent2), var(--accent));
+          display: flex; align-items: center; justify-content: center;
+          box-shadow: 0 12px 30px color-mix(in srgb, var(--accent) 35%, transparent); }
+  .logo span { font-size: 48px; }
+  h1 { font-size: 44px; letter-spacing: -0.02em; }
+  .tag { font-size: 20px; color: var(--muted); margin-top: 8px; }
+  .cta { margin-top: 28px; display: flex; gap: 12px; justify-content: center; flex-wrap: wrap; }
+  .btn { display: inline-block; padding: 12px 22px; border-radius: 10px;
+         text-decoration: none; font-weight: 600; }
+  .btn.primary { background: var(--accent); color: #fff; }
+  .btn.ghost { border: 1px solid var(--line); color: var(--fg); background: var(--card); }
+  .stats { display: flex; gap: 14px; justify-content: center; margin-top: 34px; flex-wrap: wrap; }
+  .stat { background: var(--card); border: 1px solid var(--line); border-radius: 12px;
+          padding: 14px 22px; min-width: 150px; }
+  .stat b { display: block; font-size: 26px; color: var(--accent); }
+  .stat span { font-size: 13px; color: var(--muted); }
+  section { padding: 44px 0; }
+  h2 { font-size: 26px; margin-bottom: 18px; }
+  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 14px; }
+  .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 18px; }
+  .card h3 { font-size: 16px; margin-bottom: 6px; }
+  .card p { font-size: 14px; color: var(--muted); }
+  .tablebox { overflow-x: auto; border: 1px solid var(--line); border-radius: 12px; }
+  table { border-collapse: collapse; width: 100%; background: var(--card); font-size: 14px; }
+  th, td { padding: 10px 14px; text-align: left; border-bottom: 1px solid var(--line); }
+  th { color: var(--muted); font-weight: 600; }
+  td.yes { color: #189a4a; font-weight: 600; }
+  td.no { color: var(--warn); }
+  .k { background: color-mix(in srgb, var(--accent) 10%, var(--card)); }
+  footer { padding: 36px 0 48px; color: var(--muted); font-size: 14px; text-align: center;
+           border-top: 1px solid var(--line); }
+  a { color: var(--accent); }
+</style>
+</head>
+<body>
+
+<header>
+  <div class="wrap">
+    <div class="logo"><span>⚡</span></div>
+    <h1>NTFSKit</h1>
+    <p class="tag">NTFS read &amp; write for macOS — no kext, no compromise.<br>
+    Plug in a Windows disk. It just works.</p>
+    <div class="cta">
+      <a class="btn primary" href="https://whereteam.com/ntfskit/buy">Get NTFSKit Pro</a>
+      <a class="btn ghost" href="https://github.com/whereteam/ntfskit">Free driver on GitHub</a>
+    </div>
+    <div class="stats">
+      <div class="stat"><b>572 MB/s</b><span>sequential write (driver ceiling)</span></div>
+      <div class="stat"><b>0 kexts</b><span>Full Security stays ON</span></div>
+      <div class="stat"><b>1 click</b><span>enable once, auto-mount forever</span></div>
+    </div>
+  </div>
+</header>
+
+<section>
+  <div class="wrap">
+    <h2>The first of its kind</h2>
+    <p style="color:var(--muted); margin-bottom:18px">
+      NTFSKit is the <b>world's first pure-FSKit NTFS driver with
+      Kernel-Offloaded&nbsp;I/O</b>: the macOS kernel writes your file data
+      directly to disk while the driver only maps extents — native-class
+      speed from a userspace driver that can never panic your kernel.
+    </p>
+    <div class="grid">
+      <div class="card"><h3>⚡ Kernel-fast</h3>
+        <p>Kernel-Offloaded I/O + allocate-without-zeroing writes. Your disk is the bottleneck, not the driver.</p></div>
+      <div class="card"><h3>🛡 Safe by design</h3>
+        <p>No kernel extension, no Reduced Security, survives macOS updates. Real fsck with NTFS journal replay.</p></div>
+      <div class="card"><h3>😴 Hibernation-smart</h3>
+        <p>Windows Fast Startup detected → safe read-only mount with a plain-language fix, not a mystery error.</p></div>
+      <div class="card"><h3>🍎 Mac-native files</h3>
+        <p>Extended attributes stored as NTFS ADS — no ._ litter, round-trips to Windows. Spotlight indexable.</p></div>
+      <div class="card"><h3>🧰 Disk tools built in</h3>
+        <p>First Aid, format as NTFS from Disk Utility, per-disk read-only, menu bar control. (Pro)</p></div>
+      <div class="card"><h3>🔓 Open core</h3>
+        <p>The driver is GPL-2.0 open source, free forever. Pro app conveniences fund development.</p></div>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>Compared</h2>
+    <div class="tablebox">
+    <table>
+      <tr><th></th><th class="k">NTFSKit</th><th>Paragon</th><th>Tuxera</th><th>Mounty/FUSE</th></tr>
+      <tr><td>Architecture</td><td class="k yes">FSKit (userspace)</td><td>kext</td><td>kext</td><td>macFUSE kext</td></tr>
+      <tr><td>Reduced Security needed</td><td class="k yes">Never</td><td class="no">Yes (AS)</td><td class="no">Yes (AS)</td><td class="no">Yes</td></tr>
+      <tr><td>Auto-mount read/write</td><td class="k yes">Yes</td><td class="yes">Yes</td><td class="yes">Yes</td><td class="no">Remount dance</td></tr>
+      <tr><td>Write speed</td><td class="k yes">Device speed (KOIO)</td><td class="yes">Fast</td><td class="yes">Fast</td><td class="no">~1–20 MB/s</td></tr>
+      <tr><td>Price</td><td class="k yes">Free driver · Pro one-time</td><td>$29.95</td><td>$15</td><td>Free</td></tr>
+      <tr><td>Open source</td><td class="k yes">Driver GPL-2.0</td><td class="no">No</td><td class="no">No</td><td class="yes">Yes</td></tr>
+    </table>
+    </div>
+  </div>
+</section>
+
+<section>
+  <div class="wrap">
+    <h2>Free vs Pro</h2>
+    <div class="grid">
+      <div class="card">
+        <h3>Free — the driver</h3>
+        <p>Full-speed read/write auto-mount · eject · volume list · CLI ·
+           open source, forever.</p>
+      </div>
+      <div class="card" style="border-color: var(--accent)">
+        <h3>Pro — the toolkit <span style="color:var(--warn)">· one-time, no subscription</span></h3>
+        <p>Menu bar suite · per-disk read-only policy · First Aid &amp; NTFS
+           format UI · mount notifications · hibernation assistant ·
+           priority updates. 14-day full trial built in.</p>
+      </div>
+    </div>
+  </div>
+</section>
+
+<footer>
+  <div class="wrap">
+    NTFSKit by THAN · <a href="mailto:prathan@whereteam.com">prathan@whereteam.com</a> ·
+    <a href="https://whereteam.com">whereteam.com</a><br>
+    Driver GPL-2.0, built on libntfs-3g (© Tuxera Inc. and contributors).
+    macOS 26.4+ · Apple Silicon.
+  </div>
+</footer>
+
+</body>
+</html>
