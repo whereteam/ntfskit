@@ -132,6 +132,9 @@ int nk_format(const nk_io *io, const char *label, char *errbuf, size_t errlen);
 /* 1 if the 512-byte boot sector is a BitLocker volume ("-FVE-FS-"). */
 int nk_is_bitlocker(const unsigned char boot[512]);
 
+/* 1 if the 512-byte boot sector is a ReFS volume (Windows Resilient FS). */
+int nk_is_refs(const unsigned char boot[512]);
+
 /* Credential kinds for nk_mount_bitlocker / nk_bde_open. */
 #define NK_BDE_RECOVERY 0   /* 48-digit recovery password */
 #define NK_BDE_PASSWORD 1   /* user password */

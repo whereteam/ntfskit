@@ -43,6 +43,13 @@ final class NTFSFileSystem: FSUnaryFileSystem, FSUnaryFileSystemOperations {
             log.info("probe: BitLocker-encrypted volume — needs unlock, not auto-mounted")
             return .notRecognized
         }
+        // ReFS (Windows 11 Dev Drive / Server): recognized but not yet
+        // mountable — logging it beats a silent "unreadable disk", and marks
+        // where read support plugs in.
+        if read >= 0x54, boot.withUnsafeBufferPointer({ nk_is_refs($0.baseAddress!) }) != 0 {
+            log.info("probe: ReFS volume — read support in progress, not yet mounted")
+            return .notRecognized
+        }
         // Boot sector bytes 3..6 spell "NTFS".
         guard read >= 8,
               boot[3] == 0x4E, boot[4] == 0x54, boot[5] == 0x46, boot[6] == 0x53 else {

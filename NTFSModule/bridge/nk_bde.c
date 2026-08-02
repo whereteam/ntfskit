@@ -59,6 +59,13 @@ int nk_is_bitlocker(const unsigned char boot[512]) {
     return memcmp(boot + 3, fve, 8) == 0;
 }
 
+/* ReFS (Windows Resilient File System, incl. Win11 Dev Drive): VBR OEM id at
+ * 0x03 is "ReFS\0\0\0\0" and the FSRS recognition signature is at 0x50. */
+int nk_is_refs(const unsigned char boot[512]) {
+    return memcmp(boot + 3, "ReFS", 4) == 0 &&
+           memcmp(boot + 0x50, "FSRS", 4) == 0;
+}
+
 /* ---- libbfio handle backed by our nk_io callbacks ---- */
 
 struct bde_bfio_ctx {
