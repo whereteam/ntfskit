@@ -37,7 +37,7 @@ kernel-direct on USB hardware). ~28× faster than FUSE-T-based setups.
 
 ## Requirements
 
-- macOS 26.4+ (Apple Silicon)
+- macOS 15.4+ (Apple Silicon)
 - One-time enable: System Settings → General → Login Items & Extensions →
   File System Extensions → **NTFSKit**
 
