@@ -3,148 +3,313 @@
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
-<title>NTFSKit — NTFS read &amp; write for macOS. No kext. No compromise.</title>
-<meta name="description" content="The world's first pure-FSKit NTFS driver with Kernel-Offloaded I/O. Plug in an NTFS disk — it mounts read/write at device speed.">
+<title>NTFSKit — native-speed NTFS for macOS, no kernel extension</title>
+<meta name="description" content="The first pure-FSKit NTFS read/write driver for macOS with Kernel-Offloaded I/O. Plug in a Windows disk; it mounts read/write at device speed. No kext. Full Security stays on.">
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Archivo:wght@500;700;900&family=IBM+Plex+Mono:wght@400;500;600&family=Newsreader:opsz,wght@6..72,400;6..72,500&display=swap" rel="stylesheet">
 <style>
-  :root {
-    --bg: #f5f7fb; --fg: #0d1220; --muted: #5a6376; --card: #ffffff;
-    --line: #e3e7f0; --accent: #1a5cf2; --accent2: #18b7b0; --warn: #e58900;
+  :root{
+    --ink:#0c0b09; --ink2:#141210; --panel:#17150f;
+    --paper:#f2ece0; --dim:#9b9384; --faint:#6a6459;
+    --amber:#ffb02e; --amber-2:#ffcf7a; --cyan:#5fd6c6;
+    --line:rgba(242,236,224,.13); --line-2:rgba(242,236,224,.07);
+    --mono:'IBM Plex Mono',ui-monospace,monospace;
+    --disp:'Archivo',sans-serif;
+    --serif:'Newsreader',Georgia,serif;
   }
-  @media (prefers-color-scheme: dark) {
-    :root { --bg: #0b0f17; --fg: #eef1f8; --muted: #9aa3b5; --card: #131926;
-            --line: #232b3d; --accent: #4d84ff; --accent2: #2bd4cc; }
+  *{box-sizing:border-box;margin:0;padding:0}
+  html{scroll-behavior:smooth}
+  body{
+    background:var(--ink); color:var(--paper);
+    font-family:var(--serif); font-size:18px; line-height:1.6;
+    -webkit-font-smoothing:antialiased; overflow-x:hidden;
   }
-  * { box-sizing: border-box; margin: 0; }
-  body { font: 16px/1.6 -apple-system, "SF Pro Text", Inter, sans-serif;
-         background: var(--bg); color: var(--fg); }
-  .wrap { max-width: 880px; margin: 0 auto; padding: 0 24px; }
-  header { padding: 72px 0 40px; text-align: center;
-           background: linear-gradient(160deg, color-mix(in srgb, var(--accent2) 12%, var(--bg)), var(--bg) 70%); }
-  .logo { width: 96px; height: 96px; border-radius: 22px; margin: 0 auto 18px;
-          background: linear-gradient(135deg, var(--accent2), var(--accent));
-          display: flex; align-items: center; justify-content: center;
-          box-shadow: 0 12px 30px color-mix(in srgb, var(--accent) 35%, transparent); }
-  .logo span { font-size: 48px; }
-  h1 { font-size: 44px; letter-spacing: -0.02em; }
-  .tag { font-size: 20px; color: var(--muted); margin-top: 8px; }
-  .cta { margin-top: 28px; display: flex; gap: 12px; justify-content: center; flex-wrap: wrap; }
-  .btn { display: inline-block; padding: 12px 22px; border-radius: 10px;
-         text-decoration: none; font-weight: 600; }
-  .btn.primary { background: var(--accent); color: #fff; }
-  .btn.ghost { border: 1px solid var(--line); color: var(--fg); background: var(--card); }
-  .stats { display: flex; gap: 14px; justify-content: center; margin-top: 34px; flex-wrap: wrap; }
-  .stat { background: var(--card); border: 1px solid var(--line); border-radius: 12px;
-          padding: 14px 22px; min-width: 150px; }
-  .stat b { display: block; font-size: 26px; color: var(--accent); }
-  .stat span { font-size: 13px; color: var(--muted); }
-  section { padding: 44px 0; }
-  h2 { font-size: 26px; margin-bottom: 18px; }
-  .grid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 14px; }
-  .card { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 18px; }
-  .card h3 { font-size: 16px; margin-bottom: 6px; }
-  .card p { font-size: 14px; color: var(--muted); }
-  .tablebox { overflow-x: auto; border: 1px solid var(--line); border-radius: 12px; }
-  table { border-collapse: collapse; width: 100%; background: var(--card); font-size: 14px; }
-  th, td { padding: 10px 14px; text-align: left; border-bottom: 1px solid var(--line); }
-  th { color: var(--muted); font-weight: 600; }
-  td.yes { color: #189a4a; font-weight: 600; }
-  td.no { color: var(--warn); }
-  .k { background: color-mix(in srgb, var(--accent) 10%, var(--card)); }
-  footer { padding: 36px 0 48px; color: var(--muted); font-size: 14px; text-align: center;
-           border-top: 1px solid var(--line); }
-  a { color: var(--accent); }
+  /* blueprint grid + grain */
+  body::before{
+    content:""; position:fixed; inset:0; z-index:0; pointer-events:none;
+    background-image:
+      linear-gradient(var(--line-2) 1px,transparent 1px),
+      linear-gradient(90deg,var(--line-2) 1px,transparent 1px);
+    background-size:46px 46px;
+    mask-image:radial-gradient(ellipse 90% 70% at 50% 0%,#000 30%,transparent 78%);
+  }
+  body::after{
+    content:""; position:fixed; inset:0; z-index:999; pointer-events:none; opacity:.05;
+    background-image:url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='120' height='120'%3E%3Cfilter id='n'%3E%3CfeTurbulence type='fractalNoise' baseFrequency='.9' numOctaves='3'/%3E%3C/filter%3E%3Crect width='100%25' height='100%25' filter='url(%23n)'/%3E%3C/svg%3E");
+  }
+  .wrap{max-width:1080px; margin:0 auto; padding:0 32px; position:relative; z-index:1}
+  a{color:inherit}
+  .mono{font-family:var(--mono); font-size:.72rem; letter-spacing:.14em; text-transform:uppercase}
+  .amber{color:var(--amber)}
+
+  /* nav */
+  nav{display:flex; justify-content:space-between; align-items:center;
+      padding:26px 0; border-bottom:1px solid var(--line)}
+  .brand{font-family:var(--disp); font-weight:900; font-size:1.05rem; letter-spacing:-.01em;
+         display:flex; align-items:center; gap:9px}
+  .brand .dot{width:11px; height:11px; background:var(--amber); border-radius:2px;
+              box-shadow:0 0 14px var(--amber); animation:pulse 2.6s infinite}
+  @keyframes pulse{0%,100%{opacity:1}50%{opacity:.45}}
+  nav .links{display:flex; gap:26px}
+  nav .links a{color:var(--dim); text-decoration:none; transition:color .2s}
+  nav .links a:hover{color:var(--paper)}
+
+  /* hero */
+  header{padding:96px 0 70px; position:relative}
+  .kicker{color:var(--amber); margin-bottom:26px; display:flex; gap:14px; align-items:center}
+  .kicker::before{content:""; width:38px; height:1px; background:var(--amber)}
+  h1{font-family:var(--disp); font-weight:900; letter-spacing:-.03em; line-height:.92;
+     font-size:clamp(3.2rem,10vw,7.4rem); text-transform:uppercase; max-width:14ch}
+  h1 em{font-style:normal; color:var(--amber); display:inline-block}
+  .lede{font-size:clamp(1.15rem,2.4vw,1.5rem); color:var(--paper); max-width:40ch;
+        margin:34px 0 0; line-height:1.45}
+  .lede span{color:var(--dim)}
+  .cta{display:flex; gap:16px; margin-top:40px; flex-wrap:wrap; align-items:center}
+  .btn{font-family:var(--mono); font-size:.8rem; letter-spacing:.08em; text-transform:uppercase;
+       padding:15px 26px; text-decoration:none; border:1px solid var(--amber);
+       transition:.22s; display:inline-flex; gap:10px; align-items:center}
+  .btn.solid{background:var(--amber); color:var(--ink); font-weight:600}
+  .btn.solid:hover{background:var(--amber-2); border-color:var(--amber-2)}
+  .btn.ghost{color:var(--paper); border-color:var(--line)}
+  .btn.ghost:hover{border-color:var(--paper)}
+
+  /* hero disk ring, absolute right */
+  .ring{position:absolute; right:-90px; top:70px; width:460px; height:460px;
+        opacity:.9; pointer-events:none}
+  @media(max-width:900px){.ring{display:none}}
+  .ring circle,.ring line{transform-origin:center}
+  .ring .spin{animation:spin 26s linear infinite}
+  .ring .spin-r{animation:spin 40s linear infinite reverse}
+  @keyframes spin{to{transform:rotate(360deg)}}
+
+  /* stat strip */
+  .strip{display:grid; grid-template-columns:repeat(3,1fr); border:1px solid var(--line);
+         margin-top:20px; background:var(--ink2)}
+  .strip .cell{padding:30px 26px; border-right:1px solid var(--line)}
+  .strip .cell:last-child{border-right:none}
+  .strip b{font-family:var(--disp); font-weight:900; font-size:2.6rem; display:block;
+           letter-spacing:-.02em; line-height:1}
+  .strip .cell:nth-child(1) b{color:var(--amber)}
+  .strip small{font-family:var(--mono); font-size:.68rem; letter-spacing:.12em;
+               text-transform:uppercase; color:var(--dim); display:block; margin-top:12px}
+  @media(max-width:640px){.strip{grid-template-columns:1fr}
+    .strip .cell{border-right:none; border-bottom:1px solid var(--line)}}
+
+  /* sections */
+  section{padding:88px 0; border-top:1px solid var(--line)}
+  .sec-head{display:flex; gap:18px; align-items:baseline; margin-bottom:44px}
+  .sec-head .num{font-family:var(--mono); color:var(--amber); font-size:.8rem}
+  .sec-head h2{font-family:var(--disp); font-weight:700; font-size:clamp(1.7rem,4vw,2.6rem);
+               letter-spacing:-.02em; text-transform:uppercase}
+
+  /* claim */
+  .claim{font-family:var(--serif); font-size:clamp(1.6rem,4vw,2.6rem); line-height:1.35;
+         max-width:24ch; font-weight:400}
+  .claim b{font-weight:500; color:var(--amber)}
+  .claim .u{border-bottom:2px solid var(--cyan); padding-bottom:2px}
+
+  /* architecture flow */
+  .flow{display:grid; grid-template-columns:1fr 1fr; gap:1px; background:var(--line);
+        border:1px solid var(--line)}
+  @media(max-width:760px){.flow{grid-template-columns:1fr}}
+  .flow .col{background:var(--ink); padding:32px}
+  .flow h3{font-family:var(--mono); font-size:.74rem; letter-spacing:.12em; text-transform:uppercase;
+           color:var(--dim); margin-bottom:20px}
+  .flow .them h3{color:var(--faint)}
+  .flow .us h3{color:var(--amber)}
+  .step{display:flex; gap:14px; padding:11px 0; font-size:.98rem; color:var(--paper)}
+  .step .i{font-family:var(--mono); font-size:.7rem; color:var(--faint); min-width:22px; padding-top:3px}
+  .flow .them .step{color:var(--dim)}
+  .flow .us .step .i{color:var(--amber)}
+  .verdict{font-family:var(--mono); font-size:.82rem; margin-top:22px; padding-top:20px;
+           border-top:1px dashed var(--line); letter-spacing:.03em}
+  .flow .them .verdict{color:var(--faint)} .flow .us .verdict{color:var(--cyan)}
+
+  /* spec table */
+  .spec{width:100%; border-collapse:collapse; font-size:.95rem}
+  .spec th,.spec td{text-align:left; padding:16px 14px; border-bottom:1px solid var(--line)}
+  .spec thead th{font-family:var(--mono); font-size:.68rem; letter-spacing:.1em;
+                 text-transform:uppercase; color:var(--dim); font-weight:500}
+  .spec thead th.k{color:var(--amber)}
+  .spec td:first-child{color:var(--dim); font-family:var(--mono); font-size:.78rem;
+                       letter-spacing:.03em; text-transform:uppercase}
+  .spec .k{background:rgba(255,176,46,.05); font-weight:500; color:var(--paper)}
+  .spec .yes{color:var(--amber)} .spec .mid{color:var(--paper)} .spec .no{color:var(--faint)}
+  .tbl-scroll{overflow-x:auto; border:1px solid var(--line)}
+
+  /* pricing */
+  .tiers{display:grid; grid-template-columns:1fr 1fr; gap:1px; background:var(--line);
+         border:1px solid var(--line)}
+  @media(max-width:700px){.tiers{grid-template-columns:1fr}}
+  .tier{background:var(--ink); padding:36px}
+  .tier.pro{background:var(--ink2); position:relative}
+  .tier .tag{font-family:var(--mono); font-size:.7rem; letter-spacing:.14em; text-transform:uppercase;
+             color:var(--dim)}
+  .tier.pro .tag{color:var(--amber)}
+  .tier .price{font-family:var(--disp); font-weight:900; font-size:2.4rem; margin:14px 0 4px}
+  .tier .price small{font-family:var(--mono); font-size:.7rem; color:var(--dim);
+                     letter-spacing:.06em; text-transform:uppercase; font-weight:400}
+  .tier ul{list-style:none; margin-top:22px; font-size:.95rem}
+  .tier li{padding:9px 0; padding-left:22px; position:relative; color:var(--paper); border-bottom:1px solid var(--line-2)}
+  .tier li::before{content:"›"; position:absolute; left:0; color:var(--amber)}
+  .tier .btn{margin-top:26px; width:100%; justify-content:center}
+
+  /* footer */
+  footer{border-top:1px solid var(--line); padding:54px 0 70px; color:var(--dim); font-size:.9rem}
+  footer .row{display:flex; justify-content:space-between; gap:24px; flex-wrap:wrap; align-items:flex-end}
+  footer a{color:var(--paper); text-decoration:none; border-bottom:1px solid var(--amber)}
+  footer .fine{font-family:var(--mono); font-size:.68rem; letter-spacing:.05em; color:var(--faint);
+               max-width:52ch; line-height:1.7; margin-top:14px}
+
+  /* reveal */
+  .rise{opacity:0; transform:translateY(26px); animation:rise .9s cubic-bezier(.2,.7,.2,1) forwards}
+  @keyframes rise{to{opacity:1; transform:none}}
+  .d1{animation-delay:.05s}.d2{animation-delay:.16s}.d3{animation-delay:.28s}
+  .d4{animation-delay:.4s}.d5{animation-delay:.52s}
+  @media(prefers-reduced-motion:reduce){.rise{animation:none;opacity:1;transform:none}
+    .ring .spin,.ring .spin-r,.brand .dot{animation:none}}
 </style>
 </head>
 <body>
+<div class="wrap">
 
-<header>
-  <div class="wrap">
-    <div class="logo"><span>⚡</span></div>
-    <h1>NTFSKit</h1>
-    <p class="tag">NTFS read &amp; write for macOS — no kext, no compromise.<br>
-    Plug in a Windows disk. It just works.</p>
-    <div class="cta">
-      <a class="btn primary" href="https://whereteam.com/ntfskit/buy">Get NTFSKit Pro</a>
-      <a class="btn ghost" href="https://github.com/whereteam/ntfskit">Free driver on GitHub</a>
+  <nav class="rise d1">
+    <div class="brand"><span class="dot"></span>NTFSKIT</div>
+    <div class="links mono">
+      <a href="#how">Architecture</a>
+      <a href="#spec">Spec</a>
+      <a href="#pricing">Pricing</a>
+      <a href="https://github.com/whereteam/ntfskit">GitHub ↗</a>
     </div>
-    <div class="stats">
-      <div class="stat"><b>572 MB/s</b><span>sequential write (driver ceiling)</span></div>
-      <div class="stat"><b>0 kexts</b><span>Full Security stays ON</span></div>
-      <div class="stat"><b>1 click</b><span>enable once, auto-mount forever</span></div>
+  </nav>
+
+  <header>
+    <svg class="ring" viewBox="0 0 460 460" fill="none" stroke="var(--amber)">
+      <g class="spin" opacity=".5">
+        <circle cx="230" cy="230" r="220" stroke-width="1" stroke-dasharray="3 9"/>
+      </g>
+      <g class="spin-r" opacity=".7">
+        <circle cx="230" cy="230" r="168" stroke-width="1"/>
+        <line x1="230" y1="62" x2="230" y2="98" stroke-width="2"/>
+        <line x1="230" y1="362" x2="230" y2="398" stroke-width="2"/>
+      </g>
+      <circle cx="230" cy="230" r="120" stroke-width="1" stroke-dasharray="1 6" opacity=".4"/>
+      <circle cx="230" cy="230" r="70" stroke="var(--cyan)" stroke-width="1" opacity=".6"/>
+      <circle cx="230" cy="230" r="8" fill="var(--amber)" stroke="none"/>
+      <text x="230" y="150" fill="var(--dim)" font-family="IBM Plex Mono" font-size="9"
+            letter-spacing="2" text-anchor="middle">FSKIT</text>
+    </svg>
+
+    <p class="kicker mono rise d2">World's first · FSKit + Kernel-Offloaded I/O</p>
+    <h1 class="rise d2">NTFS.<br>Native&nbsp;speed.<br><em>Zero&nbsp;kext.</em></h1>
+    <p class="lede rise d3">Plug a Windows disk into your Mac and it just mounts —
+      read <span>and</span> write, at device speed.
+      <span>No kernel extension. No Reduced Security. No terminal ritual.</span></p>
+    <div class="cta rise d4">
+      <a class="btn solid" href="https://whereteam.com/ntfskit/buy">Get NTFSKit Pro</a>
+      <a class="btn ghost" href="https://github.com/whereteam/ntfskit">Free driver, open source ↗</a>
     </div>
+  </header>
+
+  <div class="strip rise d5">
+    <div class="cell"><b>572<small style="display:inline;font-size:1rem;color:var(--dim)"> MB/s</small></b><small>Sequential write · driver ceiling</small></div>
+    <div class="cell"><b>0</b><small>Kernel extensions · Full Security on</small></div>
+    <div class="cell"><b>1×</b><small>Enable once · auto-mounts forever</small></div>
   </div>
-</header>
 
-<section>
-  <div class="wrap">
-    <h2>The first of its kind</h2>
-    <p style="color:var(--muted); margin-bottom:18px">
-      NTFSKit is the <b>world's first pure-FSKit NTFS driver with
-      Kernel-Offloaded&nbsp;I/O</b>: the macOS kernel writes your file data
-      directly to disk while the driver only maps extents — native-class
-      speed from a userspace driver that can never panic your kernel.
-    </p>
-    <div class="grid">
-      <div class="card"><h3>⚡ Kernel-fast</h3>
-        <p>Kernel-Offloaded I/O + allocate-without-zeroing writes. Your disk is the bottleneck, not the driver.</p></div>
-      <div class="card"><h3>🛡 Safe by design</h3>
-        <p>No kernel extension, no Reduced Security, survives macOS updates. Real fsck with NTFS journal replay.</p></div>
-      <div class="card"><h3>😴 Hibernation-smart</h3>
-        <p>Windows Fast Startup detected → safe read-only mount with a plain-language fix, not a mystery error.</p></div>
-      <div class="card"><h3>🍎 Mac-native files</h3>
-        <p>Extended attributes stored as NTFS ADS — no ._ litter, round-trips to Windows. Spotlight indexable.</p></div>
-      <div class="card"><h3>🧰 Disk tools built in</h3>
-        <p>First Aid, format as NTFS from Disk Utility, per-disk read-only, menu bar control. (Pro)</p></div>
-      <div class="card"><h3>🔓 Open core</h3>
-        <p>The driver is GPL-2.0 open source, free forever. Pro app conveniences fund development.</p></div>
+  <section id="claim">
+    <p class="claim">Every other NTFS driver on macOS ships a
+      <b>kernel extension</b> — or copies your files byte-by-byte in userspace.
+      NTFSKit does <span class="u">neither</span>: the kernel writes your data
+      directly to disk, while the driver just maps the blocks.</p>
+  </section>
+
+  <section id="how">
+    <div class="sec-head"><span class="num">01</span><h2>How the write path works</h2></div>
+    <div class="flow">
+      <div class="col them">
+        <h3>Legacy drivers (Paragon · Tuxera · FUSE)</h3>
+        <div class="step"><span class="i">01</span><span>App writes to the mounted volume</span></div>
+        <div class="step"><span class="i">02</span><span>Kernel extension (or FUSE bridge) intercepts</span></div>
+        <div class="step"><span class="i">03</span><span>Bytes copied through the driver's own code</span></div>
+        <div class="step"><span class="i">04</span><span>Driver writes them out to the device</span></div>
+        <div class="verdict">→ kext risk, or ~1–20 MB/s in userspace</div>
+      </div>
+      <div class="col us">
+        <h3>NTFSKit · Kernel-Offloaded I/O</h3>
+        <div class="step"><span class="i">01</span><span>App writes to the mounted volume</span></div>
+        <div class="step"><span class="i">02</span><span>Driver maps the file's on-disk extents</span></div>
+        <div class="step"><span class="i">03</span><span>Kernel writes data <em class="amber">directly</em> to those blocks</span></div>
+        <div class="step"><span class="i">04</span><span>Driver only stamps the metadata</span></div>
+        <div class="verdict">→ device-speed writes, userspace safety</div>
+      </div>
     </div>
-  </div>
-</section>
+  </section>
 
-<section>
-  <div class="wrap">
-    <h2>Compared</h2>
-    <div class="tablebox">
-    <table>
-      <tr><th></th><th class="k">NTFSKit</th><th>Paragon</th><th>Tuxera</th><th>Mounty/FUSE</th></tr>
-      <tr><td>Architecture</td><td class="k yes">FSKit (userspace)</td><td>kext</td><td>kext</td><td>macFUSE kext</td></tr>
-      <tr><td>Reduced Security needed</td><td class="k yes">Never</td><td class="no">Yes (AS)</td><td class="no">Yes (AS)</td><td class="no">Yes</td></tr>
-      <tr><td>Auto-mount read/write</td><td class="k yes">Yes</td><td class="yes">Yes</td><td class="yes">Yes</td><td class="no">Remount dance</td></tr>
-      <tr><td>Write speed</td><td class="k yes">Device speed (KOIO)</td><td class="yes">Fast</td><td class="yes">Fast</td><td class="no">~1–20 MB/s</td></tr>
-      <tr><td>Price</td><td class="k yes">Free driver · Pro one-time</td><td>$29.95</td><td>$15</td><td>Free</td></tr>
-      <tr><td>Open source</td><td class="k yes">Driver GPL-2.0</td><td class="no">No</td><td class="no">No</td><td class="yes">Yes</td></tr>
+  <section id="spec">
+    <div class="sec-head"><span class="num">02</span><h2>Spec sheet</h2></div>
+    <div class="tbl-scroll">
+    <table class="spec">
+      <thead><tr><th></th><th class="k">NTFSKit</th><th>Paragon</th><th>Tuxera</th><th>Mounty / FUSE</th></tr></thead>
+      <tbody>
+        <tr><td>Architecture</td><td class="k yes">FSKit · userspace</td><td class="no">kext</td><td class="no">kext</td><td class="no">macFUSE kext</td></tr>
+        <tr><td>Reduced Security</td><td class="k yes">Never</td><td class="no">Required</td><td class="no">Required</td><td class="no">Required</td></tr>
+        <tr><td>Auto-mount R/W</td><td class="k yes">Yes</td><td class="mid">Yes</td><td class="mid">Yes</td><td class="no">Manual remount</td></tr>
+        <tr><td>Write throughput</td><td class="k yes">Device speed (KOIO)</td><td class="mid">Fast</td><td class="mid">Fast</td><td class="no">~1–20 MB/s</td></tr>
+        <tr><td>Survives macOS updates</td><td class="k yes">By design</td><td class="no">Often breaks</td><td class="no">Often breaks</td><td class="no">Often breaks</td></tr>
+        <tr><td>Price</td><td class="k yes">Free · Pro one-time</td><td class="mid">$29.95</td><td class="mid">$15</td><td class="mid">Free</td></tr>
+        <tr><td>Source</td><td class="k yes">Driver open (GPL-2)</td><td class="no">Closed</td><td class="no">Closed</td><td class="mid">Open</td></tr>
+      </tbody>
     </table>
     </div>
-  </div>
-</section>
+  </section>
 
-<section>
-  <div class="wrap">
-    <h2>Free vs Pro</h2>
-    <div class="grid">
-      <div class="card">
-        <h3>Free — the driver</h3>
-        <p>Full-speed read/write auto-mount · eject · volume list · CLI ·
-           open source, forever.</p>
+  <section id="pricing">
+    <div class="sec-head"><span class="num">03</span><h2>The driver is free. Pro is the toolkit.</h2></div>
+    <div class="tiers">
+      <div class="tier">
+        <span class="tag">Free · open source</span>
+        <div class="price">$0<small> forever</small></div>
+        <ul>
+          <li>Full-speed read/write auto-mount</li>
+          <li>Kernel-Offloaded I/O</li>
+          <li>Eject &amp; volume list</li>
+          <li>Command-line tool</li>
+          <li>GPL-2.0 source on GitHub</li>
+        </ul>
+        <a class="btn ghost" href="https://github.com/whereteam/ntfskit">Clone it ↗</a>
       </div>
-      <div class="card" style="border-color: var(--accent)">
-        <h3>Pro — the toolkit <span style="color:var(--warn)">· one-time, no subscription</span></h3>
-        <p>Menu bar suite · per-disk read-only policy · First Aid &amp; NTFS
-           format UI · mount notifications · hibernation assistant ·
-           priority updates. 14-day full trial built in.</p>
+      <div class="tier pro">
+        <span class="tag">Pro · one-time, no subscription</span>
+        <div class="price">$12<small> once · 14-day trial</small></div>
+        <ul>
+          <li>Menu-bar volume control</li>
+          <li>Per-disk read-only policy</li>
+          <li>First Aid &amp; format as NTFS</li>
+          <li>Hibernation assistant + mount alerts</li>
+          <li>Priority updates via Sparkle</li>
+        </ul>
+        <a class="btn solid" href="https://whereteam.com/ntfskit/buy">Get Pro</a>
       </div>
     </div>
-  </div>
-</section>
+  </section>
 
-<footer>
-  <div class="wrap">
-    NTFSKit by THAN · <a href="mailto:prathan@whereteam.com">prathan@whereteam.com</a> ·
-    <a href="https://whereteam.com">whereteam.com</a><br>
-    Driver GPL-2.0, built on libntfs-3g (© Tuxera Inc. and contributors).
-    macOS 26.4+ · Apple Silicon.
-  </div>
-</footer>
+  <footer>
+    <div class="row">
+      <div>
+        <div class="brand" style="margin-bottom:10px"><span class="dot"></span>NTFSKIT</div>
+        <div class="mono" style="color:var(--faint)">macOS 26.4+ · Apple&nbsp;Silicon</div>
+      </div>
+      <div style="text-align:right">
+        <div>Built by THAN · <a href="mailto:prathan@whereteam.com">prathan@whereteam.com</a></div>
+        <div class="fine">Driver licensed GPL-2.0, built on libntfs-3g
+          (© Tuxera Inc. and contributors). NTFSKit is not affiliated with
+          Microsoft, Apple, Paragon or Tuxera.</div>
+      </div>
+    </div>
+  </footer>
 
+</div>
 </body>
 </html>
