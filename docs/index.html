@@ -184,6 +184,11 @@
   .vn .ro{font-style:normal; font-family:var(--mono); font-size:.56rem; letter-spacing:.08em;
           text-transform:uppercase; color:#c47d1a; background:#f6e6c8; padding:2px 6px;
           border-radius:20px; margin-left:6px}
+  .vn .hb{font-style:normal; font-size:.6rem; font-weight:600; margin-left:6px}
+  .vn .hb.ok{color:#1a8a4a}
+  .vn .hb.prot{color:#2f7bf6}
+  .vn .pro{font-style:normal; font-family:var(--mono); font-size:.5rem; letter-spacing:.06em;
+           color:#c47d1a; border:1px solid #e0c98a; border-radius:20px; padding:1px 5px; margin-left:4px}
   .vd{font-size:.6rem !important; color:#8a8172; margin:2px 0 6px}
   .bar{height:4px; background:#e9e1d2; border-radius:3px; overflow:hidden}
   .bar i{display:block; height:100%; background:#2f7bf6}
@@ -309,17 +314,19 @@
           <div class="app-sub">Mounted NTFS volumes</div>
           <div class="vol">
             <div class="vic"></div>
-            <div class="vmeta"><div class="vn">WORKDISK</div>
+            <div class="vmeta"><div class="vn">WORKDISK
+              <em class="hb ok">🛡 Healthy</em> <em class="pro">PRO</em></div>
               <div class="vd mono">/dev/disk4s1 · 198 GB free of 512 GB</div>
               <div class="bar"><i style="width:61%"></i></div></div>
-            <div class="vbtns"><span>⏏</span><span>🔒</span><span>🗂</span></div>
+            <div class="vbtns"><span>🩺</span><span>🔒</span><span>⏏</span></div>
           </div>
           <div class="vol">
             <div class="vic"></div>
-            <div class="vmeta"><div class="vn">WINDOWS <em class="ro">read-only</em></div>
+            <div class="vmeta"><div class="vn">WINDOWS <em class="ro">read-only</em>
+              <em class="hb prot">🔒 Protected</em></div>
               <div class="vd mono">/dev/disk5s2 · 310 GB free of 1 TB</div>
               <div class="bar"><i style="width:69%"></i></div></div>
-            <div class="vbtns"><span>⏏</span><span>🔓</span><span>🗂</span></div>
+            <div class="vbtns"><span>🩺</span><span>🔓</span><span>⏏</span></div>
           </div>
           <div class="hib"><b>😴 Windows is hibernating on this disk.</b>
             Mounted read-only to protect your files — fully shut down Windows,
