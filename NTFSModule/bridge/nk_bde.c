@@ -199,7 +199,7 @@ struct ntfs_device *nk_bde_open(const nk_io *io, const char *cred, int cred_kind
             bfio_seek, bfio_exists, bfio_is_open, bfio_get_size, 0, NULL) != 1) {
         free(bctx); free(b); return NULL;
     }
-    b->bctx = bctx;   /* freed by libbfio via bfio_free */
+    b->bctx = bctx;   /* ours: flags=0 (not MANAGED), libbfio never frees it */
 
     if (libbde_volume_initialize(&b->vol, NULL) != 1) goto fail;
     if (libbde_volume_open_file_io_handle(b->vol, b->bfio, LIBBDE_OPEN_READ, NULL) != 1) {
@@ -233,6 +233,7 @@ struct ntfs_device *nk_bde_open(const nk_io *io, const char *cred, int cred_kind
 fail:
     if (b->vol) { libbde_volume_free(&b->vol, NULL); }
     if (b->bfio) { libbfio_handle_free(&b->bfio, NULL); }
+    free(b->bctx);
     free(b);
     return NULL;
 }
@@ -241,6 +242,7 @@ void nk_bde_free(struct nk_bde *b) {
     if (!b) return;
     if (b->vol) libbde_volume_free(&b->vol, NULL);
     if (b->bfio) libbfio_handle_free(&b->bfio, NULL);
+    free(b->bctx);
     free(b->dev);
     free(b);
 }

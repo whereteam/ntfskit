@@ -7,7 +7,11 @@ import os
 final class NTFSFileSystem: FSUnaryFileSystem, FSUnaryFileSystemOperations {
 
     private let log = Logger(subsystem: "com.whereteam.ntfskit.NTFSModule", category: "fs")
+    /// Loaded resource + the volume made from it. Lock-guarded: load/unload
+    /// and check/format upcalls can arrive on different threads.
+    private let resourceLock = NSLock()
     private var lastResource: FSBlockDeviceResource?
+    private weak var lastVolume: NTFSVolume?
     /// Check and format must never run concurrently — both do raw RMW on the
     /// same device.
     static let maintenanceQueue = DispatchQueue(label: "com.whereteam.ntfskit.maintenance")
@@ -170,7 +174,6 @@ final class NTFSFileSystem: FSUnaryFileSystem, FSUnaryFileSystemOperations {
         let readOnly = !block.isWritable || opts.contains("--rdonly") ||
                        opts.contains("rdonly") || opts.contains("ro")
         log.info("load NTFS on \(block.bsdName, privacy: .public) readOnly=\(readOnly)")
-        lastResource = block
         containerStatus = .ready
         // Same serial-derived UUID as probe: DA keeps one identity per disk.
         var boot = [UInt8](repeating: 0, count: 512)
@@ -178,14 +181,17 @@ final class NTFSFileSystem: FSUnaryFileSystem, FSUnaryFileSystemOperations {
             try block.read(into: raw, startingAt: 0, length: 512)
         }
         let uuid = Self.volumeUUID(bootSector: boot)
-        return NTFSVolume(resource: block,
-                          volumeName: FSFileName(string: "NTFS"),
-                          volumeID: FSVolume.Identifier(uuid: uuid),
-                          readOnly: readOnly)
+        let volume = NTFSVolume(resource: block,
+                                volumeName: FSFileName(string: "NTFS"),
+                                volumeID: FSVolume.Identifier(uuid: uuid),
+                                readOnly: readOnly)
+        resourceLock.withLock { lastResource = block; lastVolume = volume }
+        return volume
     }
 
     func unloadResource(resource: FSResource, options: FSTaskOptions) async throws {
         // Volume closes its engine handle in deactivate().
+        resourceLock.withLock { lastResource = nil; lastVolume = nil }
     }
 }
 
@@ -204,7 +210,7 @@ extension NTFSFileSystem: FSManageableResourceMaintenanceOperations {
         // pre-completed Progress never fires, deadlocking fskitd (and with
         // it diskarbitrationd, i.e. the whole disk subsystem).
         let progress = Progress(totalUnitCount: 1)
-        let block = lastResource
+        let (block, volume) = resourceLock.withLock { (lastResource, lastVolume) }
         let log = self.log
         let checkOnly = options.taskOptions.contains("-n")
         Self.maintenanceQueue.async {
@@ -222,7 +228,10 @@ extension NTFSFileSystem: FSManageableResourceMaintenanceOperations {
                 return
             }
             let fsckIO = FsckIO(resource: block)
-            let repair = !checkOnly && block.isWritable
+            // Never do plain-write RMW under a mounted engine: check only.
+            let engineOpen = volume?.isEngineOpen ?? false
+            if engineOpen { log.info("startCheck: volume active — check only, no repair") }
+            let repair = !checkOnly && block.isWritable && !engineOpen
             var io = nk_io(ctx: Unmanaged.passUnretained(fsckIO).toOpaque(),
                            pread: fsckPreadTrampoline,
                            pwrite: fsckPwriteTrampoline,
@@ -253,7 +262,7 @@ extension NTFSFileSystem: FSManageableResourceMaintenanceOperations {
         // Real newfs: mkntfs (quick format) over the resource callbacks.
         // Same async completion contract as startCheck.
         let progress = Progress(totalUnitCount: 1)
-        let block = lastResource
+        let (block, volume) = resourceLock.withLock { (lastResource, lastVolume) }
         let log = self.log
         // `newfs -v <label>` style: label follows -v in the option syntax.
         var label = "NTFS"
@@ -269,6 +278,10 @@ extension NTFSFileSystem: FSManageableResourceMaintenanceOperations {
             }
             guard let block, block.isWritable else {
                 formatError = NSError(domain: NSPOSIXErrorDomain, code: Int(EROFS))
+                return
+            }
+            guard !(volume?.isEngineOpen ?? false) else {
+                formatError = NSError(domain: NSPOSIXErrorDomain, code: Int(EBUSY))
                 return
             }
             let io = FsckIO(resource: block)

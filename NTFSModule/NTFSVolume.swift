@@ -23,8 +23,12 @@ final class NTFSVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWriteOperati
     private var vol: OpaquePointer?              // nk_volume*
     private var nextID: UInt64 = 100
     private var idByPath: [String: FSItem.Identifier] = ["/": .rootDirectory]
-    /// Bumped on every namespace mutation so cached kernel dirents invalidate.
-    private var dirGeneration: UInt64 = 1
+    /// Per-directory listing generation (keyed by directory path), bumped when
+    /// THAT directory's entries change — a resumed readdir must not fail on
+    /// unrelated writes elsewhere. Values come from one counter so a path
+    /// never sees a reused generation; missing entries read as 1.
+    private var dirGen: [String: UInt64] = [:]
+    private var genCounter: UInt64 = 1
     /// One live NTFSItem instance per path — FSKit tracks items by object
     /// identity; handing out fresh instances per lookup leaks phantom vnodes
     /// (files stay "open" forever and unlink is deferred indefinitely).
@@ -55,6 +59,47 @@ final class NTFSVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWriteOperati
     /// originate from engine calls serialized there).
     fileprivate enum IOMode { case probing, metadata }
     fileprivate var ioMode: IOMode = .probing
+    /// Set once the kernel mount exists (engineQueue only). From then on a
+    /// buffer-cache error is a real error — falling back to plain writes
+    /// would race the kernel's direct KOIO writes.
+    fileprivate var kernelMounted = false
+
+    /// The ONE buffer-cache block size. The cache is keyed by offset and every
+    /// access to a region must use the same (offset, length) — and purge
+    /// segments must match cached blocks exactly — so all engine device I/O
+    /// and every metadataPurge uses this fixed granule. Chosen once per engine
+    /// open, before the engine touches the device (engineQueue only).
+    fileprivate var cacheBlockSize = 512
+    /// Volume cluster size (set in activate); 0 = unknown.
+    private var clusterSize = 0
+
+    /// 4 KiB only when the cluster size is a multiple of it, so no cache block
+    /// ever holds clusters of two files — otherwise an engine RMW of a shared
+    /// block can write a stale copy over a neighbour's direct KOIO write.
+    /// Else the logical block size (never larger than a mappable cluster).
+    private func pickCacheBlockSize() -> Int {
+        let bs = deviceBlockSize
+        guard bs > 0, deviceSize % 4096 == 0, 4096 % bs == 0 else { return bs }
+        let boot = UnsafeMutableRawBufferPointer.allocate(byteCount: bs, alignment: bs)
+        defer { boot.deallocate() }
+        // Plain read: valid pre- and post-mount, and keeps the cache keyed
+        // only by the final granule.
+        guard let n = try? resource.read(into: boot, startingAt: 0, length: bs),
+              n == bs else { return bs }
+        let bps = Int(boot[0x0B]) | Int(boot[0x0C]) << 8
+        let spc = Int(boot[0x0D])
+        // NTFS encoding; untrusted (probe may not have run, media may have
+        // changed): cap the exponent like probe does so this can't trap.
+        let exp = 256 - spc
+        let cs = spc > 0x80 ? (exp < 22 ? bps << exp : 0) : bps * spc
+        return cs > 0 && cs % 4096 == 0 ? 4096 : bs
+    }
+
+    /// Clusters not a multiple of the device block can't be mapped
+    /// (nk_blockmap -2), so every file must stay off KOIO.
+    private var clustersUnmappable: Bool {
+        clusterSize > 0 && clusterSize % deviceBlockSize != 0
+    }
 
     fileprivate var deviceBlockSize: Int {
         // Use the LOGICAL block size: it's the unit blockCount is measured in,
@@ -73,7 +118,7 @@ final class NTFSVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWriteOperati
     /// Aligned pread through the kernel buffer cache: read whole sectors
     /// covering [offset, offset+count) and copy out the window. -1 on error.
     fileprivate func devicePread(_ buf: UnsafeMutableRawPointer, _ count: Int64, _ offset: Int64) -> Int64 {
-        let bs = Int64(deviceBlockSize)
+        let bs = Int64(cacheBlockSize)
         if offset < 0 || count < 0 || offset > Int64.max - count { return -1 }
         let end = min(offset + count, deviceSize)
         if offset >= deviceSize || end <= offset { return 0 }
@@ -99,9 +144,20 @@ final class NTFSVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWriteOperati
 
     /// Aligned whole-block read through the current mode, upgrading to
     /// buffer-cache I/O as soon as the kernel accepts it.
+    /// `start`/`length` are cacheBlockSize-aligned; issued one cache block at
+    /// a time so every cache access uses the same (offset, length) pair.
     private func readAligned(into scratch: UnsafeMutableRawBufferPointer,
                              at start: Int64, length: Int) throws {
         dispatchPrecondition(condition: .onQueue(engineQueue))
+        let g = cacheBlockSize
+        for o in stride(from: 0, to: length, by: g) {
+            try readBlock(into: UnsafeMutableRawBufferPointer(rebasing: scratch[o..<o + g]),
+                          at: start + Int64(o), length: g)
+        }
+    }
+
+    private func readBlock(into scratch: UnsafeMutableRawBufferPointer,
+                           at start: Int64, length: Int) throws {
         if ioMode == .metadata {
             try resource.metadataRead(into: scratch, startingAt: off_t(start),
                                       length: length)
@@ -113,6 +169,7 @@ final class NTFSVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWriteOperati
             ioMode = .metadata
             log.info("device I/O upgraded to kernel buffer cache")
         } catch {
+            guard !kernelMounted else { throw error }
             let n = try resource.read(into: scratch, startingAt: off_t(start),
                                       length: length)
             guard n == length else { throw posix(EIO) }
@@ -126,6 +183,15 @@ final class NTFSVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWriteOperati
     private func writeAligned(_ scratch: UnsafeMutableRawBufferPointer,
                               at start: Int64, length: Int) throws {
         dispatchPrecondition(condition: .onQueue(engineQueue))
+        let g = cacheBlockSize
+        for o in stride(from: 0, to: length, by: g) {
+            try writeBlock(UnsafeMutableRawBufferPointer(rebasing: scratch[o..<o + g]),
+                           at: start + Int64(o), length: g)
+        }
+    }
+
+    private func writeBlock(_ scratch: UnsafeMutableRawBufferPointer,
+                            at start: Int64, length: Int) throws {
         if ioMode == .metadata {
             try resource.metadataWrite(from: UnsafeRawBufferPointer(scratch),
                                        startingAt: off_t(start), length: length)
@@ -139,6 +205,7 @@ final class NTFSVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWriteOperati
         } catch {
             // Pre-mount only: buffer cache not attached yet, no kernel I/O in
             // flight, plain write is safe.
+            guard !kernelMounted else { throw error }
             let n = try resource.write(from: UnsafeRawBufferPointer(scratch),
                                        startingAt: off_t(start), length: length)
             guard n == length else { throw posix(EIO) }
@@ -148,7 +215,7 @@ final class NTFSVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWriteOperati
     /// Aligned pwrite through the kernel buffer cache, with read-modify-write
     /// on partial edge sectors.
     fileprivate func devicePwrite(_ buf: UnsafeRawPointer, _ count: Int64, _ offset: Int64) -> Int64 {
-        let bs = Int64(deviceBlockSize)
+        let bs = Int64(cacheBlockSize)
         if offset < 0 || count < 0 || offset > Int64.max - count { return -1 }
         let end = min(offset + count, deviceSize)
         if offset >= deviceSize || end <= offset { return 0 }
@@ -192,6 +259,7 @@ final class NTFSVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWriteOperati
     private func openEngine() throws {
         try engineQueue.sync {
             guard vol == nil else { return }
+            cacheBlockSize = pickCacheBlockSize()
             var io = nk_io(ctx: Unmanaged.passUnretained(self).toOpaque(),
                            pread: nkPreadTrampoline,
                            pwrite: nkPwriteTrampoline,
@@ -226,13 +294,30 @@ final class NTFSVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWriteOperati
         engineQueue.sync {
             let rc: Int32 = vol.map { nk_umount($0) } ?? 0
             vol = nil
+            // Drop every cached device block: a format (plain writes) may
+            // follow, and the next open may pick a different granule.
+            if ioMode == .metadata {
+                let g = Int64(cacheBlockSize)
+                do {
+                    try resource.metadataPurge([FSMetadataRange(
+                        offset: 0, segmentLength: UInt64(g),
+                        segmentCount: UInt64(deviceSize / g))])
+                } catch {
+                    log.error("closeEngine purge failed: \(error, privacy: .public)")
+                }
+            }
             // If FSKit reactivates this instance, the next engine open happens
             // pre-mount again — the buffer cache won't be attached, so start
             // back in probing mode.
             ioMode = .probing
+            kernelMounted = false
             return rc
         }
     }
+
+    /// True while the engine has the device open (fsck repair/format must not
+    /// do raw RMW under it).
+    var isEngineOpen: Bool { engineQueue.sync { vol != nil } }
 
     private func id(for path: String) -> FSItem.Identifier {
         stateLock.lock(); defer { stateLock.unlock() }
@@ -243,15 +328,36 @@ final class NTFSVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWriteOperati
         return newID
     }
 
-    /// Namespace mutation bookkeeping under one lock.
-    private func mutateNamespace(_ body: () -> Void) {
+    /// Namespace mutation bookkeeping under one lock: bump the generation of
+    /// every directory (path) whose entries changed.
+    private func mutateNamespace(_ dirs: [String], _ body: () -> Void = {}) {
         stateLock.lock(); defer { stateLock.unlock() }
-        dirGeneration += 1
+        for d in dirs { genCounter += 1; dirGen[d] = genCounter }
         body()
+    }
+
+    private func parentPath(_ path: String) -> String {
+        (path as NSString).deletingLastPathComponent
+    }
+
+    /// Run one engine call on the engine queue and capture errno right after
+    /// it, before anything else can clobber it (libntfs-3g reports via errno).
+    private func engine<T>(_ body: () -> T) -> (T, Int32) {
+        engineQueue.sync {
+            errno = 0
+            let r = body()
+            return (r, errno)
+        }
     }
 
     private func posix(_ code: Int32) -> NSError {
         NSError(domain: NSPOSIXErrorDomain, code: Int(code))
+    }
+
+    /// Error for a failed engine call: the captured errno, or `fallback` when
+    /// the bridge failed without setting one.
+    private func posix(errno e: Int32, or fallback: Int32 = EIO) -> NSError {
+        posix(e != 0 ? e : fallback)
     }
 
     // MARK: FSVolume.Operations
@@ -314,10 +420,15 @@ final class NTFSVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWriteOperati
 
     func activate(options: FSTaskOptions) async throws -> FSItem {
         try openEngine()
-        var label = [CChar](repeating: 0, count: 256)
-        engineQueue.sync { _ = nk_label(vol, &label, 256) }
+        // 128 UTF-16 units can need well over 256 UTF-8 bytes (CJK).
+        var label = [CChar](repeating: 0, count: 1024)
+        engineQueue.sync { _ = nk_label(vol, &label, 1024) }
         let name = String(cString: label)
         if !name.isEmpty { self.name = FSFileName(string: name) }
+        var total: Int64 = 0, free: Int64 = 0
+        var cluster: Int32 = 0
+        engineQueue.sync { _ = nk_statvfs(vol, &total, &free, &cluster) }
+        clusterSize = Int(cluster)
         return item(path: "/", kind: .directory)
     }
 
@@ -325,15 +436,20 @@ final class NTFSVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWriteOperati
         // An unmount-time engine write failure must not be silent data loss,
         // and flushing the buffer cache at teardown is on us, not fskitd.
         let rc = closeEngine()
-        try? resource.metadataFlush()
+        var flushError: Error?
+        do { try resource.metadataFlush() } catch { flushError = error }
         guard rc == 0 else { throw posix(EIO) }
+        if let flushError { throw flushError }
     }
-    func mount(options: FSTaskOptions) async throws { try openEngine() }
+    func mount(options: FSTaskOptions) async throws {
+        try openEngine()
+        engineQueue.sync { kernelMounted = true }
+    }
     func unmount() async { closeEngine() }
 
     func synchronize(flags: FSSyncFlags) async throws {
-        let rc = engineQueue.sync { nk_sync(vol) }
-        guard rc == 0 else { throw posix(EIO) }
+        let (rc, e) = engine { nk_sync(vol) }
+        guard rc == 0 else { throw posix(errno: e) }
         try resource.metadataFlush()
     }
 
@@ -365,7 +481,7 @@ final class NTFSVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWriteOperati
         // which nk_blockmap converts on first map) rides KOIO at device speed.
         // Converting resident data is a write, so on read-only mounts resident
         // files must stay on the byte-copy path too.
-        attrs.inhibitKernelOffloadedIO = st.koio_ok == 0 ||
+        attrs.inhibitKernelOffloadedIO = st.koio_ok == 0 || clustersUnmappable ||
                                          (readOnly && st.is_resident != 0)
         attrs.modifyTime = timespec(tv_sec: Int(st.mtime), tv_nsec: 0)
         attrs.accessTime = timespec(tv_sec: Int(st.atime), tv_nsec: 0)
@@ -377,8 +493,8 @@ final class NTFSVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWriteOperati
     func attributes(_ request: FSItem.GetAttributesRequest, of item: FSItem) async throws -> FSItem.Attributes {
         guard let item = item as? NTFSItem else { throw posix(EINVAL) }
         var st = nk_stat()
-        let rc = engineQueue.sync { item.path.withCString { nk_stat_path(vol, $0, &st) } }
-        guard rc == 0 else { throw posix(ENOENT) }
+        let (rc, e) = engine { item.path.withCString { nk_stat_path(vol, $0, &st) } }
+        guard rc == 0 else { throw posix(errno: e, or: ENOENT) }
         return makeAttributes(path: item.path, st: st, identifier: item.identifier)
     }
 
@@ -386,18 +502,20 @@ final class NTFSVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWriteOperati
         guard let item = item as? NTFSItem else { throw posix(EINVAL) }
         if request.isValid(.size) {
             if readOnly { throw posix(EROFS) }
-            let rc = engineQueue.sync {
+            let (rc, e) = engine {
                 item.path.withCString { nk_truncate(vol, $0, Int64(request.size)) }
             }
-            guard rc == 0 else { throw posix(EIO) }
+            guard rc == 0 else { throw posix(errno: e) }
         }
         let atime = request.isValid(.accessTime) ? Int64(request.accessTime.tv_sec) : Int64(-1)
         let mtime = request.isValid(.modifyTime) ? Int64(request.modifyTime.tv_sec) : Int64(-1)
         let btime = request.isValid(.birthTime) ? Int64(request.birthTime.tv_sec) : Int64(-1)
         if atime >= 0 || mtime >= 0 || btime >= 0 {
-            _ = engineQueue.sync {
+            if readOnly { throw posix(EROFS) }
+            let (rc, e) = engine {
                 item.path.withCString { nk_set_times(vol, $0, atime, mtime, btime) }
             }
+            guard rc == 0 else { throw posix(errno: e) }
         }
         // Ownership/mode changes: accepted silently for now (NTFS ACL mapping
         // is a later phase); report back the real on-disk attributes.
@@ -408,13 +526,18 @@ final class NTFSVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWriteOperati
 
     func lookupItem(named name: FSFileName, inDirectory directory: FSItem) async throws -> (FSItem, FSFileName) {
         guard let dir = directory as? NTFSItem, let childName = name.string else { throw posix(EINVAL) }
-        let childPath = dir.childPath(childName)
-        var st = nk_stat()
-        let rc = engineQueue.sync { childPath.withCString { nk_stat_path(vol, $0, &st) } }
-        guard rc == 0 else { throw posix(ENOENT) }
-        let kind: FSItem.ItemType = st.is_symlink != 0 ? .symlink
-                                  : st.is_dir != 0 ? .directory : .file
-        return (item(path: childPath, kind: kind), name)
+        // stat + item() under stateLock (lock order stateLock → engineQueue):
+        // a concurrent rename can't slip between them, so there is never a
+        // second NTFSItem for one file or one cached under a dead path.
+        return try stateLock.withLock {
+            let childPath = dir.childPath(childName)
+            var st = nk_stat()
+            let (rc, e) = engine { childPath.withCString { nk_stat_path(vol, $0, &st) } }
+            guard rc == 0 else { throw posix(errno: e, or: ENOENT) }
+            let kind: FSItem.ItemType = st.is_symlink != 0 ? .symlink
+                                      : st.is_dir != 0 ? .directory : .file
+            return (item(path: childPath, kind: kind), name)
+        }
     }
 
     func enumerateDirectory(_ directory: FSItem,
@@ -428,18 +551,18 @@ final class NTFSVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWriteOperati
         // after the list, the verifier we hand back is already stale and the
         // next resume gets told to restart — never a fresh verifier on a
         // stale entry vector.
-        let generation = stateLock.withLock { dirGeneration }
+        let generation = stateLock.withLock { dirGen[dir.path, default: 1] }
         if cookie.rawValue != 0 && verifier.rawValue != generation {
             throw FSError(.invalidDirectoryCookie)
         }
 
         let collector = DirCollector()
-        let rc = engineQueue.sync {
+        let (rc, e) = engine {
             dir.path.withCString { path in
                 nk_list(vol, path, dirCollectCallback, Unmanaged.passUnretained(collector).toOpaque())
             }
         }
-        guard rc == 0 else { throw posix(EIO) }
+        guard rc == 0 else { throw posix(errno: e) }
 
         var entries: [(name: String, type: FSItem.ItemType, path: String)] = []
         if attributes == nil {
@@ -468,8 +591,10 @@ final class NTFSVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWriteOperati
                                                 identifier: id(for: entry.path))
                 }
             }
+            // nk_dirent has no symlink flag; the per-entry stat (when asked
+            // for attributes) knows the real type.
             let ok = packer.packEntry(name: FSFileName(string: entry.name),
-                                      itemType: entry.type,
+                                      itemType: entryAttrs?.type ?? entry.type,
                                       itemID: id(for: entry.path),
                                       nextCookie: FSDirectoryCookie(rawValue: UInt64(index + 1)),
                                       attributes: entryAttrs)
@@ -487,28 +612,38 @@ final class NTFSVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWriteOperati
                     attributes newAttributes: FSItem.SetAttributesRequest) async throws -> (FSItem, FSFileName) {
         guard let dir = directory as? NTFSItem, let childName = name.string else { throw posix(EINVAL) }
         if readOnly { throw posix(EROFS) }
-        let rc = engineQueue.sync {
-            dir.path.withCString { dp in
-                childName.withCString { np in
-                    type == .directory ? nk_mkdir(vol, dp, np) : nk_create(vol, dp, np)
+        // Only regular files and directories exist in the engine — never
+        // "create" a FIFO/socket/device as a regular file.
+        guard type == .file || type == .directory else { throw posix(ENOTSUP) }
+        // Engine op + cache bookkeeping in one stateLock hold (see lookupItem).
+        return try stateLock.withLock {
+            let dirPath = dir.path
+            let (rc, e) = engine {
+                dirPath.withCString { dp in
+                    childName.withCString { np in
+                        type == .directory ? nk_mkdir(vol, dp, np) : nk_create(vol, dp, np)
+                    }
                 }
             }
+            guard rc == 0 else { throw posix(errno: e) }
+            let childPath = dir.childPath(childName)
+            mutateNamespace([dirPath, childPath])
+            return (item(path: childPath, kind: type), name)
         }
-        guard rc == 0 else { throw posix(EIO) }
-        mutateNamespace {}
-        let childPath = dir.childPath(childName)
-        return (item(path: childPath, kind: type), name)
     }
 
     func removeItem(_ item: FSItem, named name: FSFileName, fromDirectory directory: FSItem) async throws {
         guard let item = item as? NTFSItem else { throw posix(EINVAL) }
         if readOnly { throw posix(EROFS) }
-        let rc = engineQueue.sync { item.path.withCString { nk_delete(vol, $0) } }
-        log.info("removeItem \(item.path, privacy: .public) rc=\(rc)")
-        guard rc == 0 else { throw posix(EIO) }
-        mutateNamespace {
-            idByPath[item.path] = nil
-            itemByPath[item.path] = nil
+        try stateLock.withLock {
+            let path = item.path
+            let (rc, e) = engine { path.withCString { nk_delete(vol, $0) } }
+            log.info("removeItem \(path, privacy: .public) rc=\(rc) errno=\(e)")
+            guard rc == 0 else { throw posix(errno: e) }
+            mutateNamespace([parentPath(path), path]) {
+                idByPath[path] = nil
+                itemByPath[path] = nil
+            }
         }
     }
 
@@ -523,61 +658,139 @@ final class NTFSVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWriteOperati
               let newName = destinationName.string else { throw posix(EINVAL) }
         if readOnly { throw posix(EROFS) }
 
-        // A directory must never move into itself or its own subtree — the
-        // engine's link-then-delete would happily create a cycle.
-        if destDir.path == item.path || destDir.path.hasPrefix(item.path + "/") {
-            throw posix(EINVAL)
-        }
-
-        // Replace semantics: remove the target first if it exists — and evict
-        // its cache entries (and any cached descendants), or the next lookup
-        // of the destination path would resurrect the dead item object.
-        if let overItem = overItem as? NTFSItem {
-            let drc = engineQueue.sync { overItem.path.withCString { nk_delete(vol, $0) } }
-            guard drc == 0 else { throw posix(EIO) }
-            mutateNamespace {
-                let overPrefix = overItem.path + "/"
-                itemByPath[overItem.path] = nil
-                idByPath[overItem.path] = nil
-                for p in itemByPath.keys where p.hasPrefix(overPrefix) {
-                    itemByPath[p] = nil
-                }
-                for p in idByPath.keys where p.hasPrefix(overPrefix) {
-                    idByPath[p] = nil
-                }
-            }
-        }
-        let rc = engineQueue.sync {
-            item.path.withCString { op in
-                destDir.path.withCString { dp in
-                    newName.withCString { np in nk_rename(vol, op, dp, np) }
-                }
-            }
-        }
-        guard rc == 0 else { throw posix(EIO) }
-
-        // The kernel keeps using the SAME item object after rename (it may be
-        // open) — rewrite its path in place and re-key the caches, including
-        // every cached descendant when a directory moves. idByPath is walked
-        // independently: enumeration seeds ids for paths with no live item.
-        mutateNamespace {
+        // Engine ops + cache re-key in ONE stateLock hold: a concurrent
+        // lookup can't insert a second NTFSItem between them (see lookupItem).
+        try stateLock.withLock {
             let oldPath = item.path
+            let destPath = destDir.path
             let newPath = destDir.childPath(newName)
-            let oldPrefix = oldPath + "/"
-            itemByPath[oldPath] = nil
-            item.path = newPath
-            itemByPath[newPath] = item
-            for p in itemByPath.keys.filter({ $0.hasPrefix(oldPrefix) }) {
-                let np = newPath + "/" + p.dropFirst(oldPrefix.count)
-                let child = itemByPath.removeValue(forKey: p)!
-                child.path = np
-                itemByPath[np] = child
+
+            // A directory must never move into itself or its own subtree — the
+            // engine's link-then-delete would happily create a cycle.
+            if destPath == oldPath || destPath.hasPrefix(oldPath + "/") {
+                throw posix(EINVAL)
             }
-            let movedID = idByPath.removeValue(forKey: oldPath) ?? item.identifier
-            idByPath[newPath] = movedID
-            for p in idByPath.keys.filter({ $0.hasPrefix(oldPrefix) }) {
-                let np = newPath + "/" + p.dropFirst(oldPrefix.count)
-                idByPath[np] = idByPath.removeValue(forKey: p)
+
+            // Replace semantics WITHOUT losing the destination on failure:
+            // park the victim under a hidden temp name, do the rename, and
+            // only then delete the victim. A failed rename (ENOSPC growing
+            // the index on a full disk, ...) moves the victim back.
+            let over = (overItem as? NTFSItem).flatMap { $0 === item ? nil : $0 }
+            let overPath = over?.path ?? ""
+            var parked: String? = nil
+            if let over {
+                // POSIX: renaming onto another link of the same file is a
+                // no-op (parking + deleting would drop one of the links).
+                var sa = nk_stat(), sb = nk_stat()
+                let same = engineQueue.sync {
+                    oldPath.withCString { nk_stat_path(vol, $0, &sa) } == 0 &&
+                    overPath.withCString { nk_stat_path(vol, $0, &sb) } == 0
+                } && sa.inode == sb.inode
+                if same { return }
+                let overDir = parentPath(overPath)
+                if over.kind == .directory {
+                    // Only an EMPTY directory may be replaced.
+                    var nonEmpty: Int32 = 0
+                    let (lrc, le) = engine {
+                        overPath.withCString { p in
+                            nk_list(vol, p, firstEntryCallback, &nonEmpty)
+                        }
+                    }
+                    guard lrc == 0 else { throw posix(errno: le) }
+                    if nonEmpty != 0 { throw posix(ENOTEMPTY) }
+                }
+                // Keep the original name in the temp name (NTFS max 255
+                // UTF-16 units) so a crash mid-way leaves something a human
+                // or chkdsk-era cleanup can restore.
+                var tmpName = ".nk-over-\(UUID().uuidString)-"
+                for ch in (overPath as NSString).lastPathComponent {
+                    if tmpName.utf16.count + String(ch).utf16.count > 255 { break }
+                    tmpName.append(ch)
+                }
+                let (prc, pe) = engine {
+                    overPath.withCString { op in
+                        overDir.withCString { dp in
+                            tmpName.withCString { np in nk_rename(vol, op, dp, np) }
+                        }
+                    }
+                }
+                guard prc == 0 else { throw posix(errno: pe) }
+                parked = (overDir == "/" ? "" : overDir) + "/" + tmpName
+            }
+
+            let (rc, e) = engine {
+                oldPath.withCString { op in
+                    destPath.withCString { dp in
+                        newName.withCString { np in nk_rename(vol, op, dp, np) }
+                    }
+                }
+            }
+            guard rc == 0 else {
+                if let parked {
+                    let overDir = parentPath(overPath)
+                    let overName = (overPath as NSString).lastPathComponent
+                    let (rrc, _) = engine {
+                        parked.withCString { op in
+                            overDir.withCString { dp in
+                                overName.withCString { np in nk_rename(vol, op, dp, np) }
+                            }
+                        }
+                    }
+                    if rrc != 0 {
+                        log.error("rename-over rollback failed; victim kept at \(parked, privacy: .public)")
+                    }
+                }
+                throw posix(errno: e)
+            }
+            if let parked, let over {
+                // An open handle on the victim must not alias the new file at
+                // its old path: point it at the parked name, which is about
+                // to vanish, so later I/O through it gets ENOENT.
+                over.path = parked
+                // The rename already succeeded — a failed victim delete only
+                // leaks a hidden entry, it must not fail the rename.
+                let (drc, de) = engine { parked.withCString { nk_delete(vol, $0) } }
+                if drc != 0 {
+                    log.error("rename-over: deleting parked victim \(parked, privacy: .public) failed errno=\(de)")
+                }
+            }
+
+            // Evict the replaced item's cache entries (and any cached
+            // descendants), or the next lookup of the destination path would
+            // resurrect the dead item object. Then re-key: the kernel keeps
+            // using the SAME item object after rename (it may be open) —
+            // rewrite its path in place and re-key the caches, including
+            // every cached descendant when a directory moves. idByPath is
+            // walked independently: enumeration seeds ids for paths with no
+            // live item.
+            mutateNamespace([parentPath(oldPath), destPath, oldPath, newPath]) {
+                if over != nil {
+                    let overPrefix = overPath + "/"
+                    itemByPath[overPath] = nil
+                    idByPath[overPath] = nil
+                    for p in itemByPath.keys where p.hasPrefix(overPrefix) {
+                        itemByPath[p] = nil
+                    }
+                    for p in idByPath.keys where p.hasPrefix(overPrefix) {
+                        idByPath[p] = nil
+                    }
+                }
+                let oldPrefix = oldPath + "/"
+                itemByPath[oldPath] = nil
+                item.path = newPath
+                itemByPath[newPath] = item
+                for p in itemByPath.keys.filter({ $0.hasPrefix(oldPrefix) }) {
+                    let np = newPath + "/" + p.dropFirst(oldPrefix.count)
+                    let child = itemByPath.removeValue(forKey: p)!
+                    child.path = np
+                    itemByPath[np] = child
+                }
+                let movedID = idByPath.removeValue(forKey: oldPath) ?? item.identifier
+                idByPath[newPath] = movedID
+                for p in idByPath.keys.filter({ $0.hasPrefix(oldPrefix) }) {
+                    let np = newPath + "/" + p.dropFirst(oldPrefix.count)
+                    idByPath[np] = idByPath.removeValue(forKey: p)
+                }
             }
         }
         return destinationName
@@ -594,6 +807,11 @@ final class NTFSVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWriteOperati
         stateLock.lock(); defer { stateLock.unlock() }
         if itemByPath[item.path] === item {
             itemByPath[item.path] = nil
+            // idByPath is deliberately kept: a path's ID must stay stable for
+            // the whole mount (fileIDs, /.vol, hard-link detection). Only
+            // delete/rename-over drop entries; rename re-keys them.
+            // ponytail: idByPath grows with every path seen this mount
+            // (crawls); MFT-number-derived IDs would remove the map (R11).
         }
     }
 
@@ -601,28 +819,28 @@ final class NTFSVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWriteOperati
 
     func read(from item: FSItem, at offset: off_t, length: Int, into buffer: FSMutableFileDataBuffer) async throws -> Int {
         guard let item = item as? NTFSItem else { throw posix(EINVAL) }
-        let n = engineQueue.sync {
+        let (n, e) = engine {
             buffer.withUnsafeMutableBytes { raw -> Int64 in
                 item.path.withCString { path in
                     nk_read(vol, path, Int64(offset), Int64(min(length, raw.count)), raw.baseAddress)
                 }
             }
         }
-        guard n >= 0 else { throw posix(EIO) }
+        guard n >= 0 else { throw posix(errno: e) }
         return Int(n)
     }
 
     func write(contents: Data, to item: FSItem, at offset: off_t) async throws -> Int {
         guard let item = item as? NTFSItem else { throw posix(EINVAL) }
         if readOnly { throw posix(EROFS) }
-        let n = engineQueue.sync {
+        let (n, e) = engine {
             contents.withUnsafeBytes { raw -> Int64 in
                 item.path.withCString { path in
                     nk_write(vol, path, Int64(offset), Int64(raw.count), raw.baseAddress)
                 }
             }
         }
-        guard n >= 0 else { throw posix(EIO) }
+        guard n >= 0 else { throw posix(errno: e) }
         return Int(n)
     }
 
@@ -631,8 +849,8 @@ final class NTFSVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWriteOperati
     func readSymbolicLink(_ item: FSItem) async throws -> FSFileName {
         guard let item = item as? NTFSItem else { throw posix(EINVAL) }
         var buf = [CChar](repeating: 0, count: 4096)
-        let rc = engineQueue.sync { item.path.withCString { nk_readlink(vol, $0, &buf, 4096) } }
-        guard rc == 0 else { throw posix(EINVAL) }
+        let (rc, e) = engine { item.path.withCString { nk_readlink(vol, $0, &buf, 4096) } }
+        guard rc == 0 else { throw posix(errno: e, or: EINVAL) }
         return FSFileName(string: String(cString: buf))
     }
 
@@ -644,17 +862,20 @@ final class NTFSVolume: FSVolume, FSVolume.Operations, FSVolume.ReadWriteOperati
               let linkName = name.string,
               let target = contents.string else { throw posix(EINVAL) }
         if readOnly { throw posix(EROFS) }
-        let rc = engineQueue.sync {
-            dir.path.withCString { dp in
-                linkName.withCString { np in
-                    target.withCString { tp in nk_create_symlink(vol, dp, np, tp) }
+        return try stateLock.withLock {
+            let dirPath = dir.path
+            let (rc, e) = engine {
+                dirPath.withCString { dp in
+                    linkName.withCString { np in
+                        target.withCString { tp in nk_create_symlink(vol, dp, np, tp) }
+                    }
                 }
             }
+            guard rc == 0 else { throw posix(errno: e) }
+            let childPath = dir.childPath(linkName)
+            mutateNamespace([dirPath, childPath])
+            return (item(path: childPath, kind: .symlink), name)
         }
-        guard rc == 0 else { throw posix(EIO) }
-        mutateNamespace {}
-        let childPath = dir.childPath(linkName)
-        return (item(path: childPath, kind: .symlink), name)
     }
 
     // MARK: not yet supported
@@ -671,8 +892,10 @@ extension NTFSVolume: FSVolume.RenameOperations {
     func setVolumeName(_ name: FSFileName) async throws -> FSFileName {
         guard let label = name.string else { throw posix(EINVAL) }
         if readOnly { throw posix(EROFS) }
-        let rc = engineQueue.sync { label.withCString { nk_set_label(vol, $0) } }
-        guard rc == 0 else { throw posix(EIO) }
+        // NTFS labels hold at most 128 UTF-16 units (the bridge fails silently).
+        guard label.utf16.count <= 128 else { throw posix(EINVAL) }
+        let (rc, e) = engine { label.withCString { nk_set_label(vol, $0) } }
+        guard rc == 0 else { throw posix(errno: e) }
         self.name = name
         return name
     }
@@ -694,12 +917,12 @@ extension NTFSVolume: FSVolume.XattrOperations {
                 .names.append(String(cString: name))
             return 0
         }
-        let rc = engineQueue.sync {
+        let (rc, e) = engine {
             item.path.withCString {
                 nk_xattr_list(vol, $0, cb, Unmanaged.passUnretained(box).toOpaque())
             }
         }
-        guard rc == 0 else { throw posix(EIO) }
+        guard rc == 0 else { throw posix(errno: e) }
         return box.names.map { FSFileName(string: $0) }
     }
 
@@ -709,26 +932,29 @@ extension NTFSVolume: FSVolume.XattrOperations {
         }
         // Size query + read under ONE engine hold — a concurrent setXattr
         // between two holds could truncate the read.
-        let result: Data? = engineQueue.sync {
-            item.path.withCString { p -> Data? in
-                xname.withCString { n -> Data? in
+        // nil data → the errno to report (ENOATTR when it doesn't exist).
+        let (result, err): (Data?, Int32) = engineQueue.sync {
+            item.path.withCString { p -> (Data?, Int32) in
+                xname.withCString { n -> (Data?, Int32) in
                     let size = nk_xattr_get(vol, p, n, nil, 0)
-                    guard size >= 0 else { return nil }
+                    guard size >= 0 else { return (nil, ENOATTR) }
                     // macOS caps xattrs at ~64 KB; a corrupt/huge ADS size must
                     // not drive a giant Data(count:) that kills the extension.
-                    guard size <= 4 << 20 else { return nil }
-                    if size == 0 { return Data() }
+                    // It EXISTS though — say "too big", not "doesn't exist",
+                    // or cp/Finder silently drop it.
+                    guard size <= 4 << 20 else { return (nil, E2BIG) }
+                    if size == 0 { return (Data(), 0) }
                     var data = Data(count: Int(size))
                     let got = data.withUnsafeMutableBytes {
                         nk_xattr_get(vol, p, n, $0.baseAddress, Int64($0.count))
                     }
-                    guard got >= 0 else { return nil }
+                    guard got >= 0 else { return (nil, ENOATTR) }
                     data.removeSubrange(Int(got)..<data.count)
-                    return data
+                    return (data, 0)
                 }
             }
         }
-        guard let result else { throw posix(ENOATTR) }
+        guard let result else { throw posix(err) }
         return result
     }
 
@@ -757,8 +983,12 @@ extension NTFSVolume: FSVolume.XattrOperations {
                         guard let raw else {   // nil value = delete
                             return nk_xattr_remove(vol, p, n) == 0 ? 0 : ENOATTR
                         }
-                        return nk_xattr_set(vol, p, n, raw.baseAddress,
-                                            Int64(raw.count)) == 0 ? 0 : EIO
+                        errno = 0
+                        guard nk_xattr_set(vol, p, n, raw.baseAddress,
+                                           Int64(raw.count)) == 0 else {
+                            return errno != 0 ? errno : EIO   // e.g. ENOSPC
+                        }
+                        return 0
                     }
                 }
             }
@@ -784,7 +1014,7 @@ extension NTFSVolume: FSVolume.OpenCloseOperations {
               item.kind == .file else { return }
         var st = nk_stat()
         let rc = engineQueue.sync { item.path.withCString { nk_stat_path(vol, $0, &st) } }
-        if rc == 0 && st.koio_ok == 0 && st.is_symlink == 0 {
+        if rc == 0 && (st.koio_ok == 0 || clustersUnmappable) && st.is_symlink == 0 {
             throw posix(EROFS)
         }
     }
@@ -805,7 +1035,6 @@ extension NTFSVolume: FSVolumeKernelOffloadedIOOperations {
     private final class ExtentBox {
         let packer: FSExtentPacker
         let resource: FSBlockDeviceResource
-        var packedAll = true
         /// Physical byte ranges handed to the kernel for direct WRITE — these
         /// must be purged from the buffer cache afterwards (the engine's
         /// zero-fill primed the cache; the kernel then writes the sectors
@@ -821,6 +1050,9 @@ extension NTFSVolume: FSVolumeKernelOffloadedIOOperations {
                       flags: FSBlockmapFlags, operationID: FSOperationID,
                       packer: FSExtentPacker) async throws {
         guard let item = file as? NTFSItem else { throw posix(EINVAL) }
+        // Nothing to map (e.g. a remainder call after the packer filled on
+        // the last extent): success, no extents. nk_blockmap rejects 0.
+        if length == 0 { return }
         let forWrite = flags.contains(.write)
         if forWrite && readOnly { throw posix(EROFS) }
 
@@ -832,37 +1064,47 @@ extension NTFSVolume: FSVolumeKernelOffloadedIOOperations {
                                            logicalOffset: off_t(logical),
                                            physicalOffset: off_t(physical < 0 ? 0 : physical),
                                            length: Int(length))
-            if !ok { box.packedAll = false; return 1 }
+            // false = "packer full": THIS extent was still packed (purge it);
+            // the bridge stops and FSKit asks again for the remainder.
             if physical >= 0 { box.writeRanges.append((physical, length)) }
-            return 0
+            return ok ? 0 : 1
         }
-        let rc = engineQueue.sync {
-            item.path.withCString {
+        var purgeFailed = false
+        let (rc, e) = engine { () -> Int32 in
+            let r = item.path.withCString {
                 nk_blockmap(vol, $0, Int64(offset), Int64(length),
                             forWrite ? 1 : 0, Int32(deviceBlockSize), cb,
                             Unmanaged.passUnretained(box).toOpaque())
             }
-        }
-        log.info("blockmap \(item.path, privacy: .public) off=\(offset) len=\(length) write=\(forWrite) rc=\(rc)")
-        guard rc == 0 else { throw posix(rc == -2 ? ENOTSUP : EIO) }
-
-        // The kernel is about to write these sectors directly; drop any copy
-        // the engine left in the buffer cache so later cache reads can't see
-        // stale data. A failed purge means possible silent corruption — fail
-        // the whole blockmap rather than continue.
-        if forWrite && !box.writeRanges.isEmpty {
-            let bs = Int64(deviceBlockSize)
-            let ranges = box.writeRanges.map { r -> FSMetadataRange in
-                let start = (r.phys / bs) * bs
-                let end = ((r.phys + r.len + bs - 1) / bs) * bs
+            // The kernel is about to write these sectors directly; drop any
+            // copy the engine left in the buffer cache so later cache reads
+            // can't see stale data. Done INSIDE the engine hold so no other
+            // engine op can re-prime (or concurrently write) those blocks
+            // between map and purge. Segments are cacheBlockSize-aligned —
+            // exactly the blocks devicePread/devicePwrite create. A failed
+            // purge means possible silent corruption — fail the blockmap.
+            guard r == 0, forWrite, !box.writeRanges.isEmpty else { return r }
+            let g = Int64(cacheBlockSize)
+            let ranges = box.writeRanges.map { w -> FSMetadataRange in
+                let start = (w.phys / g) * g
+                let end = ((w.phys + w.len + g - 1) / g) * g
                 return FSMetadataRange(offset: off_t(start),
-                                       segmentLength: UInt64(bs),
-                                       segmentCount: UInt64((end - start) / bs))
+                                       segmentLength: UInt64(g),
+                                       segmentCount: UInt64((end - start) / g))
             }
             do { try resource.metadataPurge(ranges) } catch {
                 log.error("metadataPurge failed: \(error, privacy: .public)")
-                throw posix(EIO)
+                purgeFailed = true
             }
+            return r
+        }
+        log.info("blockmap \(item.path, privacy: .public) off=\(offset) len=\(length) write=\(forWrite) rc=\(rc) extents=\(box.writeRanges.count)")
+        if rc == -2 { throw posix(ENOTSUP) }
+        // A full packer is a legal partial map (FSKit calls again for the
+        // rest). A nonzero bridge return (-1 + errno, or -errno) or a failed
+        // purge fails.
+        guard rc == 0, !purgeFailed else {
+            throw posix(errno: rc < -2 ? -rc : e)
         }
     }
 
@@ -870,17 +1112,25 @@ extension NTFSVolume: FSVolumeKernelOffloadedIOOperations {
                     status: (any Error)?, flags: FSCompleteIOFlags,
                     operationID: FSOperationID) async throws {
         guard let item = file as? NTFSItem else { throw posix(EINVAL) }
-        if flags.contains(.write) && status == nil {
+        if flags.contains(.write) && status != nil {
+            // Failed kernel write: release its in-flight window so later
+            // maps zero those bytes instead of trusting them forever.
+            _ = engineQueue.sync {
+                item.path.withCString { nk_abort_write(vol, $0, Int64(offset), Int64(length)) }
+            }
+            return
+        }
+        if flags.contains(.write) {
             // Data landed on disk via the kernel: mark the range initialized
             // (blockmapFile allocated it solid, without writing) and stamp
             // mtime. Failing to record initialized_size would make the bytes
             // read back as zeros — that's data loss, so propagate.
-            let rc = engineQueue.sync {
+            let (rc, e) = engine {
                 item.path.withCString {
                     nk_complete_write(vol, $0, Int64(offset), Int64(length))
                 }
             }
-            guard rc == 0 else { throw posix(EIO) }
+            guard rc == 0 else { throw posix(errno: e) }
             _ = engineQueue.sync {
                 item.path.withCString { nk_set_times(vol, $0, -1, Int64(time(nil)), -1) }
             }
@@ -938,4 +1188,11 @@ private let dirCollectCallback: nk_dirent_cb = { ctx, entryPtr in
         collector.items.append((String(cString: namePtr), entry.is_dir != 0, entry.size))
     }
     return 0
+}
+
+/// nk_list callback for "is this directory empty?": flags the Int32 at ctx
+/// and stops at the first real entry.
+private let firstEntryCallback: nk_dirent_cb = { ctx, _ in
+    ctx?.assumingMemoryBound(to: Int32.self).pointee = 1
+    return 1
 }

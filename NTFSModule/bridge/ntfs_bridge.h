@@ -36,7 +36,9 @@ typedef struct {
     uint64_t  inode;       /* MFT record number */
     long long atime, mtime, ctime, btime;  /* unix epoch seconds */
     int       is_symlink;  /* NTFS reparse point (Interix symlink style) */
-    int       koio_ok;     /* 1 = data is plain non-resident: kernel may map it */
+    int       koio_ok;     /* 1 = kernel may map it. 0 for compressed/encrypted/
+                              symlink, any BitLocker file, and on RO volumes a
+                              file with initialized_size < data_size */
     int       is_resident; /* data lives in the MFT record (small/new file) */
 } nk_stat;
 
@@ -94,7 +96,8 @@ int nk_sync(nk_volume *v);
 int nk_set_times(nk_volume *v, const char *path, long long atime,
                  long long mtime, long long btime);
 
-/* Read a symlink target (UTF-8) into buf. Returns 0 / -1. */
+/* Read a symlink target (UTF-8) into buf. Returns 0 / -1; -1 with
+ * errno=ENAMETOOLONG if the target doesn't fit (never truncates). */
 int nk_readlink(nk_volume *v, const char *path, char *buf, size_t buflen);
 
 /* Create a symlink `name` in `dir_path` pointing at `target`. Returns 0 / -1. */
@@ -107,8 +110,20 @@ int nk_is_dirty(nk_volume *v);
 /* Kernel-offloaded I/O support: enumerate a file's on-disk extents.
  * Callback gets byte offsets; physical == -1 means read-as-zeros.
  * blocksize = device logical block size (extent splits stay aligned to it).
- * Returns 0 ok, -1 error, -2 file not mappable (compressed/encrypted, or
- * resident on a read-only volume). */
+ * Returns 0 ok, -1 error (errno set where known), -2 not mappable. -2 is a
+ * hard failure of this I/O (FSKit has no per-call fallback); the host must
+ * already have inhibited KOIO for such files: compressed/encrypted, resident
+ * on a read-only volume, BitLocker volume, cluster size not a multiple of
+ * blocksize, or a read whose partial block at initialized_size can't be
+ * zeroed (RO volume) — nk_stat_path reports koio_ok=0 for most of these.
+ * The callback returning non-zero means "packer full": that extent was taken,
+ * no more fit. The map stops and returns 0 with only the packed prefix
+ * recorded; FSKit calls again for the remainder.
+ * for_write: the window is recorded as in flight until nk_complete_write
+ * covers it; bytes between initialized_size and the window are zeroed HERE
+ * (never at completion). Pairing contract for the host: every successful
+ * for_write map whose kernel write succeeds must be followed by
+ * nk_complete_write for that range, under the same serialization. */
 typedef int (*nk_extent_cb)(void *ctx, long long logical, long long physical,
                             long long length);
 int nk_blockmap(nk_volume *v, const char *path, long long offset,
@@ -116,10 +131,21 @@ int nk_blockmap(nk_volume *v, const char *path, long long offset,
                 nk_extent_cb cb, void *ctx);
 
 /* After the kernel reports a successful offloaded write of
- * [offset, offset+length): zero any allocated-but-unwritten gap below the
- * window and advance initialized_size to cover it. Returns 0 / -1. */
+ * [offset, offset+length): advance initialized_size to cover it (clamped to
+ * data_size; a no-op if the file was truncated below offset meanwhile). Writes
+ * no data — completions may arrive in any order. Returns 0 / -1 (-1 also when
+ * the MFT record can't be flushed). */
 int nk_complete_write(nk_volume *v, const char *path, long long offset,
                       long long length);
+
+/* The kernel's offloaded write of [offset, offset+length) failed: release
+ * its in-flight record so later maps zero those bytes (a lower window, below
+ * other in-flight writes, is zeroed on disk right away). Returns 0 / -1.
+ * Known limitation: a retry of the same range mapped BEFORE this abort runs
+ * can have its in-flight write zeroed/un-tracked; fixing it needs
+ * per-operation IDs passed through blockmap/complete/abort. */
+int nk_abort_write(nk_volume *v, const char *path, long long offset,
+                   long long length);
 
 /* fsck: 0 clean, 1 dirty (fixed when repair=1), -1 corrupt, -2 hibernated. */
 int nk_fsck(const nk_io *io, int repair, char *errbuf, size_t errlen);
@@ -151,7 +177,8 @@ int nk_set_label(nk_volume *v, const char *label);
 
 /* Extended attributes stored as NTFS named data streams (Windows ADS).
  * list: cb per name (return nonzero to stop). get: buf=NULL → size query;
- * returns bytes or -1. set: create-or-replace. remove: 0 / -1. */
+ * returns bytes or -1 (errno=ERANGE if bufsize < value size — never a partial
+ * value). set: create-or-replace. remove: 0 / -1. */
 typedef int (*nk_name_cb)(void *ctx, const char *name);
 int nk_xattr_list(nk_volume *v, const char *path, nk_name_cb cb, void *ctx);
 long long nk_xattr_get(nk_volume *v, const char *path, const char *name,
